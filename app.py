@@ -441,9 +441,18 @@ def _extract_stock_id(text: str) -> str | None:
     if m:
         return m.group(1)
     favorites = load_favorites()
+    # 完整名稱優先
     for s in favorites:
         if s["name"] in text:
             return s["id"]
+    # 部分名稱比對（至少 2 字元的子字串）
+    for s in favorites:
+        name = s["name"]
+        for size in range(len(name), 1, -1):
+            for start in range(len(name) - size + 1):
+                segment = name[start:start + size]
+                if segment in text:
+                    return s["id"]
     return None
 
 def parse_natural_language_command(text: str) -> dict:
