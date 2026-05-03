@@ -485,6 +485,38 @@ def parse_natural_language_command(text: str) -> dict:
 
 
 # --- Telegram ---
+def predict_and_report_single(stock_id: str):
+    today = datetime.now().strftime("%Y-%m-%d")
+    favorites = load_favorites()
+    fav = next((s for s in favorites if s["id"] == stock_id), None)
+    stock_name = fav["name"] if fav else stock_id
+    try:
+        send_telegram(f"⏳ 分析 {stock_name}（{stock_id}）中，請稍候...")
+        df = fetch_stock_data(stock_id)
+        if df.empty or len(df) < 40:
+            send_telegram(f"❌ {stock_name}（{stock_id}）資料不足，無法預測")
+            return
+        taiex_df = fetch_taiex()
+        inst_df = fetch_institutional(stock_id)
+        news = fetch_news_sentiment(stock_id, stock_name)
+        sentiment = news.get("score", 0.0)
+        current_price = float(df["close"].iloc[-1])
+        preds = predict_xgb(df, inst_df=inst_df, taiex_df=taiex_df, sentiment_score=sentiment, days=1)
+        predicted_price = round(preds[0], 2)
+        direction = "up" if predicted_price > current_price else "down"
+        arrow = "↑" if direction == "up" else "↓"
+        sentiment_text = f"\n📰 新聞情緒：{news.get('label', '')}" if news.get("label") else ""
+        send_telegram(
+            f"📊 <b>{stock_name}（{stock_id}）預測</b>\n\n"
+            f"目前價格：{current_price}\n"
+            f"預測方向：{arrow} {'看漲' if direction == 'up' else '看跌'}\n"
+            f"預測價格：<b>{predicted_price}</b>{sentiment_text}\n\n"
+            f"🤖 AI 預測僅供參考，投資請謹慎"
+        )
+    except Exception as e:
+        send_telegram(f"❌ 分析 {stock_name}（{stock_id}）失敗：{e}")
+
+
 def send_telegram(message: str):
     cfg = load_config()["telegram"]
     url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
@@ -656,11 +688,11 @@ def handle_telegram_commands():
                     nl_arg = parsed.get("stock_id") or ""
 
                     if nl_cmd == "predict":
-                        send_telegram("⏳ 開始執行預測，請稍候...")
-                        run_daily_predictions()
                         if nl_arg:
-                            send_single_stock_report(nl_arg)
+                            predict_and_report_single(nl_arg)
                         else:
+                            send_telegram("⏳ 開始執行預測，請稍候...")
+                            run_daily_predictions()
                             send_morning_report()
 
                     elif nl_cmd == "report":
