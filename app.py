@@ -16,8 +16,7 @@ warnings.filterwarnings("ignore")
 
 from FinMind.data import DataLoader
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.ensemble import GradientBoostingRegressor
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -90,33 +89,24 @@ def calc_indicators(df):
     return df
 
 
-def predict_lstm(df, days=5):
-    prices = df["close"].values.reshape(-1, 1)
+def predict_gbr(df, days=5):
+    prices = df["close"].values
     scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(prices)
+    scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
     seq_len = min(30, len(scaled) - 1)
     X, y = [], []
     for i in range(seq_len, len(scaled)):
-        X.append(scaled[i - seq_len:i, 0])
-        y.append(scaled[i, 0])
+        X.append(scaled[i - seq_len:i])
+        y.append(scaled[i])
     X, y = np.array(X), np.array(y)
-    X = X.reshape(X.shape[0], X.shape[1], 1)
-    model = Sequential([
-        LSTM(50, return_sequences=True, input_shape=(seq_len, 1)),
-        Dropout(0.2),
-        LSTM(50),
-        Dropout(0.2),
-        Dense(1)
-    ])
-    model.compile(optimizer="adam", loss="mse")
-    model.fit(X, y, epochs=20, batch_size=16, verbose=0)
-    last_seq = scaled[-seq_len:]
+    model = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
+    model.fit(X, y)
+    last_seq = list(scaled[-seq_len:])
     predictions = []
     for _ in range(days):
-        inp = last_seq.reshape(1, seq_len, 1)
-        pred = model.predict(inp, verbose=0)[0][0]
+        pred = model.predict([last_seq])[0]
         predictions.append(pred)
-        last_seq = np.append(last_seq[1:], [[pred]], axis=0)
+        last_seq = last_seq[1:] + [pred]
     return scaler.inverse_transform(np.array(predictions).reshape(-1, 1)).flatten().tolist()
 
 
@@ -132,7 +122,7 @@ def run_daily_predictions():
             if df.empty or len(df) < 35:
                 continue
             current_price = float(df["close"].iloc[-1])
-            preds = predict_lstm(df, days=1)
+            preds = predict_gbr(df, days=1)
             predicted_price = round(preds[0], 2)
             direction = "up" if predicted_price > current_price else "down"
 
@@ -256,7 +246,7 @@ async def analyze(req: StockRequest):
             return {"error": "找不到此股票代碼"}
         df = calc_indicators(df)
         recent = df.tail(60).copy()
-        predictions = predict_lstm(df)
+        predictions = predict_gbr(df)
         last_date = pd.to_datetime(df["date"].iloc[-1])
         future_dates = [(last_date + timedelta(days=i+1)).strftime("%Y-%m-%d") for i in range(5)]
         close = recent["close"].tolist()
