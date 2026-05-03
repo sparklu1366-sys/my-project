@@ -450,7 +450,7 @@ def parse_natural_language_command(text: str) -> dict:
     stock_id = _extract_stock_id(text)
     for w in _PREDICT_WORDS:
         if w in text:
-            return {"command": "predict", "stock_id": None}
+            return {"command": "predict", "stock_id": stock_id}
     for w in _NEWS_WORDS:
         if w in text:
             return {"command": "news", "stock_id": stock_id}
@@ -480,6 +480,32 @@ def send_telegram(message: str):
     cfg = load_config()["telegram"]
     url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
     http_requests.post(url, json={"chat_id": cfg["chat_id"], "text": message, "parse_mode": "HTML"})
+
+
+def send_single_stock_report(stock_id: str):
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT p.stock_name, p.stock_id, p.current_price, p.predicted_price, p.predicted_direction,
+               n.label, n.sentiment_score
+        FROM predictions p
+        LEFT JOIN news_cache n ON p.stock_id = n.stock_id
+        WHERE p.date = ? AND p.stock_id = ?
+    """, (today, stock_id)).fetchall()
+    conn.close()
+    if not rows:
+        send_telegram(f"⚠️ 今日尚無 {stock_id} 的預測資料")
+        return
+    r = rows[0]
+    arrow = "↑" if r[4] == "up" else "↓"
+    sentiment = f"\n📰 新聞情緒：{r[5]}" if r[5] else ""
+    send_telegram(
+        f"📊 <b>{r[0]}（{r[1]}）預測</b>\n\n"
+        f"目前價格：{r[2]}\n"
+        f"預測方向：{arrow} {'看漲' if r[4] == 'up' else '看跌'}\n"
+        f"預測價格：<b>{r[3]}</b>{sentiment}\n\n"
+        f"🤖 AI 預測僅供參考，投資請謹慎"
+    )
 
 
 def send_morning_report():
@@ -623,7 +649,10 @@ def handle_telegram_commands():
                     if nl_cmd == "predict":
                         send_telegram("⏳ 開始執行預測，請稍候...")
                         run_daily_predictions()
-                        send_morning_report()
+                        if nl_arg:
+                            send_single_stock_report(nl_arg)
+                        else:
+                            send_morning_report()
 
                     elif nl_cmd == "report":
                         send_morning_report()
