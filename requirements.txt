@@ -11,3 +11,5 @@ apscheduler==3.10.4
 tqdm==4.67.3
 aiohttp==3.13.5
 pydantic==2.13.3
+yfinance==0.2.51
+beautifulsoup4==4.12.3

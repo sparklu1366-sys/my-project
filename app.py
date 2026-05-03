@@ -16,8 +16,9 @@ warnings.filterwarnings("ignore")
 
 from FinMind.data import DataLoader
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 import yfinance as yf
+import threading
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -98,14 +99,40 @@ def save_favorites(stocks):
 
 def fetch_stock_data(stock_id: str):
     api = DataLoader()
-    start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
     df = api.taiwan_stock_daily(stock_id=stock_id, start_date=start)
     return df.sort_values("date").reset_index(drop=True)
+
+
+def fetch_institutional(stock_id: str):
+    try:
+        api = DataLoader()
+        start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+        df = api.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start)
+        df["net"] = df["buy"] - df["sell"]
+        pivot = df.pivot_table(index="date", columns="name", values="net", aggfunc="sum").fillna(0)
+        pivot.columns = [f"inst_{c}" for c in pivot.columns]
+        pivot = pivot.reset_index()
+        return pivot
+    except:
+        return pd.DataFrame()
+
+
+def fetch_taiex():
+    try:
+        api = DataLoader()
+        start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+        df = api.taiwan_stock_daily(stock_id="IR0001", start_date=start)
+        df = df[["date", "close"]].rename(columns={"close": "taiex"})
+        return df
+    except:
+        return pd.DataFrame()
 
 
 def calc_indicators(df):
     df["MA5"] = df["close"].rolling(5).mean()
     df["MA20"] = df["close"].rolling(20).mean()
+    df["MA60"] = df["close"].rolling(60).mean()
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
@@ -117,25 +144,102 @@ def calc_indicators(df):
     return df
 
 
-def predict_gbr(df, days=5):
-    prices = df["close"].values
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
-    seq_len = min(30, len(scaled) - 1)
-    X, y = [], []
-    for i in range(seq_len, len(scaled)):
-        X.append(scaled[i - seq_len:i])
-        y.append(scaled[i])
-    X, y = np.array(X), np.array(y)
-    model = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
-    model.fit(X, y)
-    last_seq = list(scaled[-seq_len:])
+def build_features(df, inst_df=None, taiex_df=None, sentiment_score=0.0):
+    d = df.copy()
+
+    # 技術指標
+    d["MA5"] = d["close"].rolling(5).mean()
+    d["MA20"] = d["close"].rolling(20).mean()
+    d["MA60"] = d["close"].rolling(60).mean()
+    delta = d["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    d["RSI"] = 100 - (100 / (1 + gain / loss))
+    ema12 = d["close"].ewm(span=12).mean()
+    ema26 = d["close"].ewm(span=26).mean()
+    d["MACD"] = ema12 - ema26
+    d["Signal"] = d["MACD"].ewm(span=9).mean()
+
+    # 布林通道
+    d["BB_mid"] = d["close"].rolling(20).mean()
+    d["BB_std"] = d["close"].rolling(20).std()
+    d["BB_upper"] = d["BB_mid"] + 2 * d["BB_std"]
+    d["BB_lower"] = d["BB_mid"] - 2 * d["BB_std"]
+    d["BB_pct"] = (d["close"] - d["BB_lower"]) / (d["BB_upper"] - d["BB_lower"] + 1e-9)
+
+    # 價格動能
+    d["ret1"] = d["close"].pct_change(1)
+    d["ret5"] = d["close"].pct_change(5)
+    d["ret20"] = d["close"].pct_change(20)
+
+    # 成交量特徵
+    d["vol_ma5"] = d["Trading_Volume"].rolling(5).mean()
+    d["vol_ratio"] = d["Trading_Volume"] / (d["vol_ma5"] + 1)
+
+    # MA 交叉
+    d["ma5_20"] = d["MA5"] / (d["MA20"] + 1e-9)
+    d["price_ma20"] = d["close"] / (d["MA20"] + 1e-9)
+
+    # 星期幾
+    d["weekday"] = pd.to_datetime(d["date"]).dt.weekday
+
+    # 新聞情緒
+    d["sentiment"] = sentiment_score
+
+    # 大盤
+    if taiex_df is not None and not taiex_df.empty:
+        d = d.merge(taiex_df, on="date", how="left")
+        d["taiex"] = d["taiex"].ffill()
+        d["taiex_ret"] = d["taiex"].pct_change(1)
+    else:
+        d["taiex_ret"] = 0.0
+
+    # 法人籌碼
+    if inst_df is not None and not inst_df.empty:
+        d = d.merge(inst_df, on="date", how="left").fillna(0)
+
+    return d
+
+
+def predict_xgb(df, inst_df=None, taiex_df=None, sentiment_score=0.0, days=5):
+    d = build_features(df, inst_df, taiex_df, sentiment_score)
+
+    feature_cols = ["MA5", "MA20", "MA60", "RSI", "MACD", "Signal",
+                    "BB_pct", "ret1", "ret5", "ret20",
+                    "vol_ratio", "ma5_20", "price_ma20",
+                    "weekday", "sentiment", "taiex_ret"]
+    inst_cols = [c for c in d.columns if c.startswith("inst_")]
+    feature_cols += inst_cols
+
+    d = d.dropna(subset=feature_cols + ["close"])
+    if len(d) < 40:
+        return [float(df["close"].iloc[-1])] * days
+
+    X = d[feature_cols].values
+    y = d["close"].values
+
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+
+    model = HistGradientBoostingRegressor(
+        max_iter=300, max_depth=4, learning_rate=0.05,
+        min_samples_leaf=5, random_state=42
+    )
+    model.fit(X_scaled, y_scaled)
+
+    # 預測未來 N 天
+    last_row = d[feature_cols].iloc[-1].values.copy()
     predictions = []
     for _ in range(days):
-        pred = model.predict([last_seq])[0]
-        predictions.append(pred)
-        last_seq = last_seq[1:] + [pred]
-    return scaler.inverse_transform(np.array(predictions).reshape(-1, 1)).flatten().tolist()
+        x_in = scaler_X.transform([last_row])
+        pred_scaled = model.predict(x_in)[0]
+        pred_price = scaler_y.inverse_transform([[pred_scaled]])[0][0]
+        predictions.append(round(float(pred_price), 2))
+        last_row[feature_cols.index("ret1")] = (pred_price - float(d["close"].iloc[-1])) / float(d["close"].iloc[-1])
+
+    return predictions
 
 
 # --- Real-time price ---
@@ -250,13 +354,17 @@ def run_daily_predictions():
     today = datetime.now().strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_PATH)
 
+    taiex_df = fetch_taiex()
     for stock in favorites:
         try:
             df = fetch_stock_data(stock["id"])
-            if df.empty or len(df) < 35:
+            if df.empty or len(df) < 40:
                 continue
+            inst_df = fetch_institutional(stock["id"])
+            news = fetch_news_sentiment(stock["id"], stock["name"])
+            sentiment = news.get("score", 0.0)
             current_price = float(df["close"].iloc[-1])
-            preds = predict_gbr(df, days=1)
+            preds = predict_xgb(df, inst_df=inst_df, taiex_df=taiex_df, sentiment_score=sentiment, days=1)
             predicted_price = round(preds[0], 2)
             direction = "up" if predicted_price > current_price else "down"
 
@@ -361,12 +469,117 @@ def send_morning_report():
     send_telegram("\n".join(lines))
 
 
+# --- Telegram command handler ---
+_last_update_id = 0
+
+HELP_TEXT = """📋 <b>可用指令</b>
+
+/預測 — 立即執行預測並發送報告
+/報告 — 發送今日預測報告
+/檢查 — 立即檢查停損價
+/新聞 2330 — 查詢股票新聞情緒
+/加入 2330 — 新增自選股
+/刪除 2330 — 刪除自選股
+/清單 — 顯示目前自選股
+/說明 — 顯示此說明"""
+
+
+def handle_telegram_commands():
+    global _last_update_id
+    cfg = load_config()["telegram"]
+    token = cfg["token"]
+    allowed_chat = str(cfg["chat_id"])
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={_last_update_id + 1}&timeout=30"
+            resp = http_requests.get(url, timeout=35)
+            updates = resp.json().get("result", [])
+
+            for update in updates:
+                _last_update_id = update["update_id"]
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip()
+
+                if chat_id != allowed_chat or not text:
+                    continue
+
+                parts = text.split()
+                cmd = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else ""
+
+                if cmd in ["/預測", "/predict"]:
+                    send_telegram("⏳ 開始執行預測，請稍候...")
+                    run_daily_predictions()
+                    send_morning_report()
+
+                elif cmd in ["/報告", "/report"]:
+                    send_morning_report()
+
+                elif cmd in ["/檢查", "/check"]:
+                    send_telegram("🔍 檢查停損價中...")
+                    check_stop_loss()
+                    send_telegram("✅ 停損檢查完成")
+
+                elif cmd in ["/新聞", "/news"] and arg:
+                    stocks = load_favorites()
+                    stock = next((s for s in stocks if s["id"] == arg), {"name": arg})
+                    result = fetch_news_sentiment(arg, stock["name"])
+                    headlines = "\n".join(f"• {h}" for h in result["headlines"]) or "無相關新聞"
+                    send_telegram(f"📰 <b>{stock['name']}({arg}) 新聞情緒：{result['label']}</b>\n\n{headlines}")
+
+                elif cmd in ["/加入", "/add"] and arg:
+                    try:
+                        api = DataLoader()
+                        df = api.taiwan_stock_info()
+                        row = df[df["stock_id"] == arg]
+                        name = str(row["stock_name"].iloc[0]) if not row.empty else arg
+                        stocks = load_favorites()
+                        if any(s["id"] == arg for s in stocks):
+                            send_telegram(f"⚠️ {name}({arg}) 已在清單中")
+                        else:
+                            stocks.append({"id": arg, "name": name})
+                            save_favorites(stocks)
+                            send_telegram(f"✅ 已加入：{name}({arg})")
+                    except Exception as e:
+                        send_telegram(f"❌ 加入失敗：{e}")
+
+                elif cmd in ["/刪除", "/remove"] and arg:
+                    stocks = load_favorites()
+                    found = next((s for s in stocks if s["id"] == arg), None)
+                    if found:
+                        save_favorites([s for s in stocks if s["id"] != arg])
+                        send_telegram(f"✅ 已刪除：{found['name']}({arg})")
+                    else:
+                        send_telegram(f"⚠️ 找不到股票代碼 {arg}")
+
+                elif cmd in ["/清單", "/list"]:
+                    stocks = load_favorites()
+                    lines = [f"• {s['name']}（{s['id']}）" for s in stocks]
+                    send_telegram(f"⭐ <b>自選股清單（{len(stocks)} 支）</b>\n\n" + "\n".join(lines))
+
+                elif cmd in ["/說明", "/help"]:
+                    send_telegram(HELP_TEXT)
+
+                else:
+                    send_telegram(f"❓ 未知指令：{text}\n\n輸入 /說明 查看所有指令")
+
+        except Exception as e:
+            print(f"Telegram polling error: {e}")
+            import time
+            time.sleep(5)
+
+
 # --- Scheduler ---
 scheduler = BackgroundScheduler()
 scheduler.add_job(run_daily_predictions, "cron", hour=18, minute=0)
 scheduler.add_job(send_morning_report, "cron", hour=8, minute=0)
 scheduler.add_job(check_stop_loss, "cron", minute="*/30")
 scheduler.start()
+
+# 啟動 Telegram 指令監聽
+threading.Thread(target=handle_telegram_commands, daemon=True).start()
 
 
 # --- API Routes ---
@@ -395,9 +608,13 @@ async def analyze(req: StockRequest):
         df = fetch_stock_data(req.stock_id)
         if df.empty:
             return {"error": "找不到此股票代碼"}
+        inst_df = fetch_institutional(req.stock_id)
+        taiex_df = fetch_taiex()
+        news = fetch_news_sentiment(req.stock_id, req.stock_id)
+        sentiment = news.get("score", 0.0)
         df = calc_indicators(df)
         recent = df.tail(60).copy()
-        predictions = predict_gbr(df)
+        predictions = predict_xgb(df, inst_df=inst_df, taiex_df=taiex_df, sentiment_score=sentiment)
         last_date = pd.to_datetime(df["date"].iloc[-1])
         future_dates = [(last_date + timedelta(days=i+1)).strftime("%Y-%m-%d") for i in range(5)]
         close = recent["close"].tolist()
@@ -459,7 +676,8 @@ async def remove_favorite(stock_id: str):
 @app.post("/favorites/predict-now")
 async def predict_now():
     run_daily_predictions()
-    return {"status": "ok", "message": "預測完成"}
+    send_morning_report()
+    return {"status": "ok", "message": "預測完成並已發送 Telegram"}
 
 
 @app.post("/notify/test")
