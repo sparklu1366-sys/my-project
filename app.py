@@ -19,7 +19,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import HistGradientBoostingRegressor
 import yfinance as yf
 import threading
-import re
+import anthropic
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -424,64 +424,53 @@ def update_actual_prices():
     conn.close()
 
 
-# --- Natural Language Command Parser (rule-based, no API key needed) ---
-_PREDICT_WORDS = ["預測", "分析", "跑一下", "預估", "幫我看"]
-_REPORT_WORDS  = ["報告", "今天", "今日", "結果"]
-_CHECK_WORDS   = ["停損", "檢查", "價格", "虧損"]
-_NEWS_WORDS    = ["新聞", "消息", "報導", "情緒"]
-_ADD_WORDS     = ["加入", "追蹤", "新增", "訂閱"]
-_REMOVE_WORDS  = ["刪除", "移除", "取消", "退出"]
-_LIST_WORDS    = ["清單", "我的股票", "自選", "列表"]
-_HELP_WORDS    = ["說明", "怎麼用", "指令", "幫助", "help"]
-
-_STOCK_RE = re.compile(r'(?<!\d)(\d{4,6})(?!\d)')
-
-def _extract_stock_id(text: str) -> str | None:
-    m = _STOCK_RE.search(text)
-    if m:
-        return m.group(1)
-    favorites = load_favorites()
-    # 完整名稱優先
-    for s in favorites:
-        if s["name"] in text:
-            return s["id"]
-    # 部分名稱比對（至少 2 字元的子字串）
-    for s in favorites:
-        name = s["name"]
-        for size in range(len(name), 1, -1):
-            for start in range(len(name) - size + 1):
-                segment = name[start:start + size]
-                if segment in text:
-                    return s["id"]
-    return None
+# --- Natural Language Command Parser (Claude API) ---
+_anthropic_client = anthropic.Anthropic()
 
 def parse_natural_language_command(text: str) -> dict:
-    stock_id = _extract_stock_id(text)
-    for w in _PREDICT_WORDS:
-        if w in text:
-            return {"command": "predict", "stock_id": stock_id}
-    for w in _NEWS_WORDS:
-        if w in text:
-            return {"command": "news", "stock_id": stock_id}
-    for w in _ADD_WORDS:
-        if w in text:
-            return {"command": "add", "stock_id": stock_id}
-    for w in _REMOVE_WORDS:
-        if w in text:
-            return {"command": "remove", "stock_id": stock_id}
-    for w in _LIST_WORDS:
-        if w in text:
-            return {"command": "list", "stock_id": None}
-    for w in _CHECK_WORDS:
-        if w in text:
-            return {"command": "check", "stock_id": None}
-    for w in _REPORT_WORDS:
-        if w in text:
-            return {"command": "report", "stock_id": None}
-    for w in _HELP_WORDS:
-        if w in text:
-            return {"command": "help", "stock_id": None}
-    return {"command": "unknown", "stock_id": None}
+    try:
+        favorites = load_favorites()
+        stock_list = "、".join([f"{s['name']}({s['id']})" for s in favorites]) or "（無自選股）"
+        response = _anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=64,
+            system=f"""你是台灣股票機器人的指令解析器。根據用戶的自然語言判斷指令，回傳 JSON。
+
+目前自選股: {stock_list}
+
+指令對照表:
+- predict: 預測/分析（「預測」「分析」「跑一下」等）
+- report: 今日報告（「報告」「今天結果」等）
+- check: 檢查停損（「停損」「檢查價格」等）
+- news: 查詢新聞，需 stock_id（「台積電新聞」「2330消息」等）
+- add: 加入自選股，需 stock_id（「加入」「追蹤」等）
+- remove: 刪除自選股，需 stock_id（「刪除」「移除」等）
+- list: 顯示自選股（「清單」「我的股票」等）
+- help: 說明（「怎麼用」「指令」等）
+- unknown: 無法識別
+
+stock_id: 提取台灣股票代碼（4-6位數字），若為股票名稱請轉為代碼（如台積電→2330、台灣大哥大→3045）。無則填 null。
+
+只回傳 JSON，格式: {{"command":"...","stock_id":null}}""",
+            messages=[{"role": "user", "content": text}],
+            output_config={"format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "enum": ["predict", "report", "check", "news", "add", "remove", "list", "help", "unknown"]},
+                        "stock_id": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                    },
+                    "required": ["command", "stock_id"],
+                    "additionalProperties": False
+                }
+            }}
+        )
+        text_block = next(b for b in response.content if b.type == "text")
+        return json.loads(text_block.text)
+    except Exception as e:
+        print(f"NL parse error: {e}")
+        return {"command": "unknown", "stock_id": None}
 
 
 # --- Telegram ---
