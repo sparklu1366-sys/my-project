@@ -19,6 +19,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import HistGradientBoostingRegressor
 import yfinance as yf
 import threading
+import re
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -423,6 +424,57 @@ def update_actual_prices():
     conn.close()
 
 
+# --- Natural Language Command Parser (rule-based, no API key needed) ---
+_PREDICT_WORDS = ["預測", "分析", "跑一下", "預估", "幫我看"]
+_REPORT_WORDS  = ["報告", "今天", "今日", "結果"]
+_CHECK_WORDS   = ["停損", "檢查", "價格", "虧損"]
+_NEWS_WORDS    = ["新聞", "消息", "報導", "情緒"]
+_ADD_WORDS     = ["加入", "追蹤", "新增", "訂閱"]
+_REMOVE_WORDS  = ["刪除", "移除", "取消", "退出"]
+_LIST_WORDS    = ["清單", "我的股票", "自選", "列表"]
+_HELP_WORDS    = ["說明", "怎麼用", "指令", "幫助", "help"]
+
+_STOCK_RE = re.compile(r'\b(\d{4,6})\b')
+
+def _extract_stock_id(text: str) -> str | None:
+    m = _STOCK_RE.search(text)
+    if m:
+        return m.group(1)
+    favorites = load_favorites()
+    for s in favorites:
+        if s["name"] in text:
+            return s["id"]
+    return None
+
+def parse_natural_language_command(text: str) -> dict:
+    stock_id = _extract_stock_id(text)
+    for w in _PREDICT_WORDS:
+        if w in text:
+            return {"command": "predict", "stock_id": None}
+    for w in _NEWS_WORDS:
+        if w in text:
+            return {"command": "news", "stock_id": stock_id}
+    for w in _ADD_WORDS:
+        if w in text:
+            return {"command": "add", "stock_id": stock_id}
+    for w in _REMOVE_WORDS:
+        if w in text:
+            return {"command": "remove", "stock_id": stock_id}
+    for w in _LIST_WORDS:
+        if w in text:
+            return {"command": "list", "stock_id": None}
+    for w in _CHECK_WORDS:
+        if w in text:
+            return {"command": "check", "stock_id": None}
+    for w in _REPORT_WORDS:
+        if w in text:
+            return {"command": "report", "stock_id": None}
+    for w in _HELP_WORDS:
+        if w in text:
+            return {"command": "help", "stock_id": None}
+    return {"command": "unknown", "stock_id": None}
+
+
 # --- Telegram ---
 def send_telegram(message: str):
     cfg = load_config()["telegram"]
@@ -563,7 +615,66 @@ def handle_telegram_commands():
                     send_telegram(HELP_TEXT)
 
                 else:
-                    send_telegram(f"❓ 未知指令：{text}\n\n輸入 /說明 查看所有指令")
+                    # 自然語言解析
+                    parsed = parse_natural_language_command(text)
+                    nl_cmd = parsed.get("command", "unknown")
+                    nl_arg = parsed.get("stock_id") or ""
+
+                    if nl_cmd == "predict":
+                        send_telegram("⏳ 開始執行預測，請稍候...")
+                        run_daily_predictions()
+                        send_morning_report()
+
+                    elif nl_cmd == "report":
+                        send_morning_report()
+
+                    elif nl_cmd == "check":
+                        send_telegram("🔍 檢查停損價中...")
+                        check_stop_loss()
+                        send_telegram("✅ 停損檢查完成")
+
+                    elif nl_cmd == "news" and nl_arg:
+                        stocks = load_favorites()
+                        stock = next((s for s in stocks if s["id"] == nl_arg), {"name": nl_arg})
+                        result = fetch_news_sentiment(nl_arg, stock["name"])
+                        headlines = "\n".join(f"• {h}" for h in result["headlines"]) or "無相關新聞"
+                        send_telegram(f"📰 <b>{stock['name']}({nl_arg}) 新聞情緒：{result['label']}</b>\n\n{headlines}")
+
+                    elif nl_cmd == "add" and nl_arg:
+                        try:
+                            api = DataLoader()
+                            df = api.taiwan_stock_info()
+                            row = df[df["stock_id"] == nl_arg]
+                            name = str(row["stock_name"].iloc[0]) if not row.empty else nl_arg
+                            stocks = load_favorites()
+                            if any(s["id"] == nl_arg for s in stocks):
+                                send_telegram(f"⚠️ {name}({nl_arg}) 已在清單中")
+                            else:
+                                stocks.append({"id": nl_arg, "name": name})
+                                save_favorites(stocks)
+                                send_telegram(f"✅ 已加入：{name}({nl_arg})")
+                        except Exception as e:
+                            send_telegram(f"❌ 加入失敗：{e}")
+
+                    elif nl_cmd == "remove" and nl_arg:
+                        stocks = load_favorites()
+                        found = next((s for s in stocks if s["id"] == nl_arg), None)
+                        if found:
+                            save_favorites([s for s in stocks if s["id"] != nl_arg])
+                            send_telegram(f"✅ 已刪除：{found['name']}({nl_arg})")
+                        else:
+                            send_telegram(f"⚠️ 找不到股票代碼 {nl_arg}")
+
+                    elif nl_cmd == "list":
+                        stocks = load_favorites()
+                        lines = [f"• {s['name']}（{s['id']}）" for s in stocks]
+                        send_telegram(f"⭐ <b>自選股清單（{len(stocks)} 支）</b>\n\n" + "\n".join(lines))
+
+                    elif nl_cmd == "help":
+                        send_telegram(HELP_TEXT)
+
+                    else:
+                        send_telegram(f"❓ 無法識別您的指令\n\n輸入 /說明 查看所有指令")
 
         except Exception as e:
             print(f"Telegram polling error: {e}")
