@@ -434,7 +434,7 @@ _REMOVE_WORDS  = ["刪除", "移除", "取消", "退出"]
 _LIST_WORDS    = ["清單", "我的股票", "自選", "列表"]
 _HELP_WORDS    = ["說明", "怎麼用", "指令", "幫助", "help"]
 
-_STOCK_RE = re.compile(r'\b(\d{4,6})\b')
+_STOCK_RE = re.compile(r'(?<!\d)(\d{4,6})(?!\d)')
 
 def _extract_stock_id(text: str) -> str | None:
     m = _STOCK_RE.search(text)
