@@ -426,6 +426,7 @@ def update_actual_prices():
 
 # --- Natural Language Command Parser (Claude API) ---
 _anthropic_client = anthropic.Anthropic()
+print(f"[INIT] ANTHROPIC_API_KEY loaded: {'YES' if os.environ.get('ANTHROPIC_API_KEY') else 'NO'}")
 
 def parse_natural_language_command(text: str) -> dict:
     try:
