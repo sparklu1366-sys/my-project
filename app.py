@@ -424,9 +424,35 @@ def update_actual_prices():
     conn.close()
 
 
-# --- Natural Language Command Parser (Claude API) ---
-_anthropic_client = anthropic.Anthropic()
+# --- Natural Language Command Parser ---
+_anthropic_client = anthropic.Anthropic(max_retries=3, timeout=15.0)
 print(f"[INIT] ANTHROPIC_API_KEY loaded: {'YES' if os.environ.get('ANTHROPIC_API_KEY') else 'NO'}")
+
+# 規則比對備援
+_RULE_MAP = [
+    (["預測", "分析", "跑一下", "預估", "幫我看"], "predict"),
+    (["新聞", "消息", "報導", "情緒"], "news"),
+    (["加入", "追蹤", "新增", "訂閱"], "add"),
+    (["刪除", "移除", "取消", "退出"], "remove"),
+    (["清單", "我的股票", "自選", "列表"], "list"),
+    (["停損", "檢查", "價格", "虧損"], "check"),
+    (["報告", "今天", "今日", "結果"], "report"),
+    (["說明", "怎麼用", "指令", "幫助"], "help"),
+]
+_STOCK_RE = __import__("re").compile(r"(?<!\d)(\d{4,6})(?!\d)")
+
+def _rule_parse(text: str) -> dict:
+    m = _STOCK_RE.search(text)
+    stock_id = m.group(1) if m else None
+    if not stock_id:
+        for s in load_favorites():
+            if s["name"] in text:
+                stock_id = s["id"]
+                break
+    for words, cmd in _RULE_MAP:
+        if any(w in text for w in words):
+            return {"command": cmd, "stock_id": stock_id}
+    return {"command": "unknown", "stock_id": None}
 
 def parse_natural_language_command(text: str) -> dict:
     try:
@@ -457,13 +483,12 @@ stock_id: 台灣股票代碼數字（如2330），名稱轉代碼（台積電→
         )
         text_block = next(b for b in response.content if b.type == "text")
         raw = text_block.text.strip()
-        # 擷取 JSON（避免 Claude 在前後加文字）
         start = raw.find("{")
         end = raw.rfind("}") + 1
         return json.loads(raw[start:end])
     except Exception as e:
-        print(f"NL parse error: {e}")
-        return {"command": "unknown", "stock_id": None}
+        print(f"NL parse error: {e}，改用規則比對")
+        return _rule_parse(text)
 
 
 # --- Telegram ---
