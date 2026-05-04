@@ -212,6 +212,7 @@ def predict_xgb(df, inst_df=None, taiex_df=None, sentiment_score=0.0, days=5):
     inst_cols = [c for c in d.columns if c.startswith("inst_")]
     feature_cols += inst_cols
 
+    d = d.replace([np.inf, -np.inf], np.nan)
     d = d.dropna(subset=feature_cols + ["close"])
     if len(d) < 40:
         return [float(df["close"].iloc[-1])] * days
@@ -528,11 +529,28 @@ stock_id: 台灣股票代碼數字（如2330），名稱轉代碼（台積電→
 
 
 # --- Telegram ---
+def _lookup_stock_name(stock_id: str) -> str:
+    name = _CODE_TO_NAME.get(stock_id)
+    if name:
+        return name
+    try:
+        api = DataLoader()
+        df = api.taiwan_stock_info()
+        row = df[df["stock_id"] == stock_id]
+        if not row.empty:
+            n = str(row["stock_name"].iloc[0]).strip()
+            _CODE_TO_NAME[stock_id] = n
+            return n
+    except Exception:
+        pass
+    return stock_id
+
+
 def predict_and_report_single(stock_id: str):
     today = datetime.now().strftime("%Y-%m-%d")
     favorites = load_favorites()
     fav = next((s for s in favorites if s["id"] == stock_id), None)
-    stock_name = fav["name"] if fav else _CODE_TO_NAME.get(stock_id, stock_id)
+    stock_name = fav["name"] if fav else _lookup_stock_name(stock_id)
     try:
         send_telegram(f"⏳ 分析 {stock_name}（{stock_id}）中，請稍候...")
         df = fetch_stock_data(stock_id)
