@@ -656,12 +656,17 @@ def handle_telegram_commands():
     token = cfg["token"]
     allowed_chat = str(cfg["chat_id"])
 
-    # 啟動時跳過所有舊訊息
+    # 啟動時清空所有待處理訊息
     try:
-        resp = http_requests.get(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1&limit=1", timeout=10)
+        resp = http_requests.get(f"https://api.telegram.org/bot{token}/getUpdates?timeout=0", timeout=10)
         updates = resp.json().get("result", [])
         if updates:
             _last_update_id = updates[-1]["update_id"]
+            # 告知 Telegram 已處理到此 update_id
+            http_requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates?offset={_last_update_id + 1}&timeout=0",
+                timeout=10
+            )
     except Exception:
         pass
 
