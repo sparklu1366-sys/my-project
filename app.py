@@ -442,8 +442,9 @@ _RULE_MAP = [
 _STOCK_RE = __import__("re").compile(r"(?<!\d)(\d{4,6})(?!\d)")
 
 # 股票名稱/簡稱 → 代碼對照表（啟動時從 TWSE/TPEx 動態載入）
-def _build_name_map() -> dict:
-    result = {}
+def _build_name_map() -> tuple:
+    name_to_code = {}
+    code_to_name = {}
     sources = [
         "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",    # 上市
         "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", # 上櫃
@@ -459,15 +460,16 @@ def _build_name_map() -> dict:
                 if not code:
                     continue
                 if short:
-                    result[short] = code
+                    name_to_code[short] = code
+                    code_to_name[code] = short   # 以簡稱為顯示名稱
                 if full and full != short:
-                    result[full] = code
+                    name_to_code[full] = code
         except Exception as e:
             print(f"[INIT] 無法載入股票對照表 {url}: {e}")
-    print(f"[INIT] 股票名稱對照表載入 {len(result)} 筆")
-    return result
+    print(f"[INIT] 股票名稱對照表載入 {len(name_to_code)} 筆")
+    return name_to_code, code_to_name
 
-_NAME_MAP = _build_name_map()
+_NAME_MAP, _CODE_TO_NAME = _build_name_map()
 
 def _rule_parse(text: str) -> dict:
     m = _STOCK_RE.search(text)
@@ -530,7 +532,7 @@ def predict_and_report_single(stock_id: str):
     today = datetime.now().strftime("%Y-%m-%d")
     favorites = load_favorites()
     fav = next((s for s in favorites if s["id"] == stock_id), None)
-    stock_name = fav["name"] if fav else stock_id
+    stock_name = fav["name"] if fav else _CODE_TO_NAME.get(stock_id, stock_id)
     try:
         send_telegram(f"⏳ 分析 {stock_name}（{stock_id}）中，請稍候...")
         df = fetch_stock_data(stock_id)
