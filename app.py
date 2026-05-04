@@ -441,49 +441,42 @@ _RULE_MAP = [
 ]
 _STOCK_RE = __import__("re").compile(r"(?<!\d)(\d{4,6})(?!\d)")
 
-# 常用股票名稱/簡稱 → 代碼對照表
-_NAME_MAP = {
-    "台積電": "2330", "台灣積體": "2330",
-    "台灣大哥大": "3045", "台灣大": "3045",
-    "鴻海": "2317", "富士康": "2317",
-    "聯發科": "2454",
-    "中華電": "2412", "中華電信": "2412",
-    "台達電": "2308",
-    "國泰金": "2882", "國泰": "2882",
-    "富邦金": "2881", "富邦": "2881",
-    "元大台灣50": "0050", "台灣50": "0050",
-    "元大高股息": "0056", "高股息": "0056",
-    "兆豐金": "2886", "兆豐": "2886",
-    "聯電": "2303",
-    "元大金": "2885",
-    "廣達": "2382",
-    "和碩": "4938",
-    "台塑": "1301",
-    "南亞": "1303",
-    "中鋼": "2002",
-    "台達": "2308",
-    "聯發": "2454",
-    "大立光": "3008",
-    "玉山金": "2884", "玉山": "2884",
-    "中信金": "2891", "中信": "2891",
-    "台泥": "1101",
-    "統一": "1216",
-    "遠傳": "4904",
-    "聯詠": "3034",
-    "瑞昱": "2379",
-    "日月光": "3711",
-    "欣興": "3037",
-    "穩懋": "3105", "穩懋半導體": "3105",
-}
+# 股票名稱/簡稱 → 代碼對照表（啟動時從 TWSE/TPEx 動態載入）
+def _build_name_map() -> dict:
+    result = {}
+    sources = [
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",    # 上市
+        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", # 上櫃
+    ]
+    for url in sources:
+        try:
+            resp = http_requests.get(url, timeout=10)
+            resp.raise_for_status()
+            for row in resp.json():
+                code = (row.get("公司代號") or row.get("SecuritiesCompanyCode") or "").strip()
+                short = (row.get("公司簡稱") or row.get("CompanyAbbreviation") or "").strip()
+                full = (row.get("公司名稱") or row.get("CompanyName") or "").strip()
+                if not code:
+                    continue
+                if short:
+                    result[short] = code
+                if full and full != short:
+                    result[full] = code
+        except Exception as e:
+            print(f"[INIT] 無法載入股票對照表 {url}: {e}")
+    print(f"[INIT] 股票名稱對照表載入 {len(result)} 筆")
+    return result
+
+_NAME_MAP = _build_name_map()
 
 def _rule_parse(text: str) -> dict:
     m = _STOCK_RE.search(text)
     stock_id = m.group(1) if m else None
     if not stock_id:
-        # 名稱對照表
-        for name, sid in _NAME_MAP.items():
+        # 名稱對照表（長名稱優先，避免短名稱誤中）
+        for name in sorted(_NAME_MAP, key=len, reverse=True):
             if name in text:
-                stock_id = sid
+                stock_id = _NAME_MAP[name]
                 break
     if not stock_id:
         for s in load_favorites():
