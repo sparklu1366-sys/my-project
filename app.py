@@ -656,6 +656,15 @@ def handle_telegram_commands():
     token = cfg["token"]
     allowed_chat = str(cfg["chat_id"])
 
+    # 啟動時跳過所有舊訊息
+    try:
+        resp = http_requests.get(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1&limit=1", timeout=10)
+        updates = resp.json().get("result", [])
+        if updates:
+            _last_update_id = updates[-1]["update_id"]
+    except Exception:
+        pass
+
     while True:
         try:
             url = f"https://api.telegram.org/bot{token}/getUpdates?offset={_last_update_id + 1}&timeout=30"
