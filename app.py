@@ -434,40 +434,32 @@ def parse_natural_language_command(text: str) -> dict:
         response = _anthropic_client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=64,
-            system=f"""你是台灣股票機器人的指令解析器。根據用戶的自然語言判斷指令，回傳 JSON。
+            system=f"""你是台灣股票機器人指令解析器。只回傳 JSON，不要其他文字。
 
-目前自選股: {stock_list}
+自選股: {stock_list}
 
-指令對照表:
-- predict: 預測/分析（「預測」「分析」「跑一下」等）
-- report: 今日報告（「報告」「今天結果」等）
-- check: 檢查停損（「停損」「檢查價格」等）
-- news: 查詢新聞，需 stock_id（「台積電新聞」「2330消息」等）
-- add: 加入自選股，需 stock_id（「加入」「追蹤」等）
-- remove: 刪除自選股，需 stock_id（「刪除」「移除」等）
-- list: 顯示自選股（「清單」「我的股票」等）
-- help: 說明（「怎麼用」「指令」等）
+指令:
+- predict: 預測/分析（含股票名或代碼表示單股預測）
+- report: 今日報告
+- check: 檢查停損
+- news: 新聞（需 stock_id）
+- add: 加入自選股（需 stock_id）
+- remove: 刪除自選股（需 stock_id）
+- list: 清單
+- help: 說明
 - unknown: 無法識別
 
-stock_id: 提取台灣股票代碼（4-6位數字），若為股票名稱請轉為代碼（如台積電→2330、台灣大哥大→3045）。無則填 null。
+stock_id: 台灣股票代碼數字（如2330），名稱轉代碼（台積電→2330，台灣大哥大→3045），無則 null。
 
-只回傳 JSON，格式: {{"command":"...","stock_id":null}}""",
-            messages=[{"role": "user", "content": text}],
-            output_config={"format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "enum": ["predict", "report", "check", "news", "add", "remove", "list", "help", "unknown"]},
-                        "stock_id": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                    },
-                    "required": ["command", "stock_id"],
-                    "additionalProperties": False
-                }
-            }}
+格式: {{"command":"...","stock_id":null}}""",
+            messages=[{"role": "user", "content": text}]
         )
         text_block = next(b for b in response.content if b.type == "text")
-        return json.loads(text_block.text)
+        raw = text_block.text.strip()
+        # 擷取 JSON（避免 Claude 在前後加文字）
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        return json.loads(raw[start:end])
     except Exception as e:
         print(f"NL parse error: {e}")
         return {"command": "unknown", "stock_id": None}
