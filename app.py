@@ -834,8 +834,11 @@ scheduler.add_job(send_morning_report, "cron", hour=8, minute=0)
 scheduler.add_job(check_stop_loss, "cron", minute="*/30")
 scheduler.start()
 
-# 啟動 Telegram 指令監聽
-threading.Thread(target=handle_telegram_commands, daemon=True).start()
+# 啟動 Telegram 指令監聽（設定 DISABLE_TELEGRAM=1 可停用，用於本機開發）
+if not os.environ.get("DISABLE_TELEGRAM"):
+    threading.Thread(target=handle_telegram_commands, daemon=True).start()
+else:
+    print("[INIT] Telegram polling disabled (DISABLE_TELEGRAM=1)")
 
 
 # --- API Routes ---
