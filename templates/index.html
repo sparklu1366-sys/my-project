@@ -170,6 +170,9 @@ tr:last-child td { border-bottom: none; }
 
   <!-- 勝率統計 -->
   <div class="page" id="page-winrate">
+    <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+      <button onclick="refreshActuals()" id="btnRefreshActuals" style="padding:8px 16px;background:#2d3048;border:1px solid #3d4068;color:#fff;border-radius:6px;cursor:pointer">🔄 更新實際結果</button>
+    </div>
     <div class="winrate-summary" id="wrSummary"></div>
     <div class="chart-box" style="margin-bottom:20px"><h3>各股票近一個月勝率</h3><div id="wrChart"></div></div>
     <table><thead><tr><th>股票</th><th>預測次數</th><th>已驗證</th><th>正確</th><th>勝率</th><th>勝率圖</th></tr></thead>
@@ -426,6 +429,15 @@ async function checkNow() {
   await fetch("/stop-loss/check-now", {method: "POST"});
   btn.textContent = "立即檢查現價"; btn.disabled = false;
   loadStopLoss();
+}
+
+async function refreshActuals() {
+  const btn = document.getElementById("btnRefreshActuals");
+  btn.textContent = "更新中..."; btn.disabled = true;
+  await fetch("/update-actuals", {method: "POST"});
+  await new Promise(r => setTimeout(r, 3000));
+  await loadWinrate();
+  btn.textContent = "🔄 更新實際結果"; btn.disabled = false;
 }
 
 // --- 勝率 ---

@@ -832,7 +832,11 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(run_daily_predictions, "cron", hour=18, minute=0)
 scheduler.add_job(send_morning_report, "cron", hour=8, minute=0)
 scheduler.add_job(check_stop_loss, "cron", minute="*/30")
+scheduler.add_job(update_actual_prices, "cron", hour=9, minute=30)
 scheduler.start()
+
+# 啟動時補算尚未驗證的預測
+threading.Thread(target=update_actual_prices, daemon=True).start()
 
 # 啟動 Telegram 指令監聽（設定 DISABLE_TELEGRAM=1 可停用，用於本機開發）
 if not os.environ.get("DISABLE_TELEGRAM"):
@@ -1042,3 +1046,9 @@ async def get_history():
     return [{"date": r[0], "stock_id": r[1], "stock_name": r[2], "current_price": r[3],
              "predicted_price": r[4], "predicted_direction": r[5], "actual_price": r[6],
              "actual_direction": r[7], "is_correct": r[8]} for r in rows]
+
+
+@app.post("/update-actuals")
+async def trigger_update_actuals():
+    threading.Thread(target=update_actual_prices, daemon=True).start()
+    return {"status": "started"}
