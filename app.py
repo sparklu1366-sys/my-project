@@ -230,6 +230,36 @@ def build_features(df, inst_df=None, taiex_df=None, sentiment_score=0.0, margin_
     else:
         d["margin_net"] = 0.0
 
+    # 法人思維特徵
+    foreign_col = next((c for c in d.columns if "外資" in c or "Foreign" in c), None)
+    trust_col   = next((c for c in d.columns if "投信" in c or "Investment_Trust" in c or ("Trust" in c and "inst_" in c)), None)
+    dealer_col  = next((c for c in d.columns if "自營" in c or "Dealer" in c), None)
+
+    if foreign_col:
+        d["foreign_net_5d"]  = d[foreign_col].rolling(5).sum()
+        d["foreign_net_20d"] = d[foreign_col].rolling(20).sum()
+        is_buy = d[foreign_col] > 0
+        grp = (is_buy != is_buy.shift()).cumsum()
+        streak = is_buy.groupby(grp).cumcount() + 1
+        d["foreign_consecutive"] = streak * np.where(is_buy, 1, -1)
+    else:
+        d["foreign_net_5d"] = d["foreign_net_20d"] = d["foreign_consecutive"] = 0.0
+
+    d["trust_net_5d"]  = d[trust_col].rolling(5).sum()  if trust_col  else 0.0
+    d["dealer_net_5d"] = d[dealer_col].rolling(5).sum() if dealer_col else 0.0
+
+    if foreign_col and trust_col and dealer_col:
+        total = d[foreign_col] + d[trust_col] + d[dealer_col]
+        d["inst_agree"]    = ((np.sign(d[foreign_col]) == np.sign(d[trust_col])) &
+                              (np.sign(d[trust_col])   == np.sign(d[dealer_col]))).astype(float)
+        d["inst_total_5d"] = total.rolling(5).sum()
+        if "Trading_Volume" in d.columns:
+            d["inst_vol_ratio"] = total / (d["Trading_Volume"].abs() + 1)
+        else:
+            d["inst_vol_ratio"] = 0.0
+    else:
+        d["inst_agree"] = d["inst_total_5d"] = d["inst_vol_ratio"] = 0.0
+
     return d
 
 
@@ -306,9 +336,12 @@ def predict_with_confidence(df, inst_df=None, taiex_df=None, margin_df=None,
     base_cols = ["MA5", "MA20", "MA60", "RSI", "MACD", "Signal",
                  "BB_pct", "ret1", "ret5", "ret20",
                  "vol_ratio", "ma5_20", "price_ma20",
-                 "weekday", "sentiment", "taiex_ret", "margin_net"]
+                 "weekday", "sentiment", "taiex_ret", "margin_net",
+                 "foreign_net_5d", "foreign_net_20d", "foreign_consecutive",
+                 "trust_net_5d", "dealer_net_5d",
+                 "inst_agree", "inst_total_5d", "inst_vol_ratio"]
     inst_cols = [c for c in d.columns if c.startswith("inst_")]
-    feature_cols = base_cols + inst_cols
+    feature_cols = base_cols + [c for c in inst_cols if c not in base_cols]
 
     d = d.replace([np.inf, -np.inf], np.nan)
     d = d.dropna(subset=feature_cols + ["close"])
