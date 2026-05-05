@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 
 from FinMind.data import DataLoader
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 import yfinance as yf
 import threading
 import anthropic
@@ -82,6 +82,11 @@ def init_db():
         )
     """)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE predictions ADD COLUMN confidence REAL")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
     conn.close()
 
 init_db()
@@ -100,7 +105,7 @@ def save_favorites(stocks):
 
 def fetch_stock_data(stock_id: str):
     api = DataLoader()
-    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
     df = api.taiwan_stock_daily(stock_id=stock_id, start_date=start)
     return df.sort_values("date").reset_index(drop=True)
 
@@ -108,7 +113,7 @@ def fetch_stock_data(stock_id: str):
 def fetch_institutional(stock_id: str):
     try:
         api = DataLoader()
-        start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
         df = api.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start)
         df["net"] = df["buy"] - df["sell"]
         pivot = df.pivot_table(index="date", columns="name", values="net", aggfunc="sum").fillna(0)
@@ -122,12 +127,31 @@ def fetch_institutional(stock_id: str):
 def fetch_taiex():
     try:
         api = DataLoader()
-        start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
         df = api.taiwan_stock_daily(stock_id="IR0001", start_date=start)
         df = df[["date", "close"]].rename(columns={"close": "taiex"})
         return df
     except:
         return pd.DataFrame()
+
+
+def fetch_margin_data(stock_id: str):
+    try:
+        api = DataLoader()
+        start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+        df = api.taiwan_stock_margin_purchase_short_sale(stock_id=stock_id, start_date=start)
+        if df is None or df.empty:
+            return None
+        df = df.copy()
+        buy_col = next((c for c in df.columns if "Buy" in c and "Margin" in c), None)
+        sell_col = next((c for c in df.columns if "Sell" in c and "Short" in c), None)
+        if buy_col and sell_col:
+            df["margin_net"] = df[buy_col].fillna(0) - df[sell_col].fillna(0)
+        else:
+            df["margin_net"] = 0.0
+        return df[["date", "margin_net"]].sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
 
 
 def calc_indicators(df):
@@ -145,7 +169,7 @@ def calc_indicators(df):
     return df
 
 
-def build_features(df, inst_df=None, taiex_df=None, sentiment_score=0.0):
+def build_features(df, inst_df=None, taiex_df=None, sentiment_score=0.0, margin_df=None):
     d = df.copy()
 
     # 技術指標
@@ -199,6 +223,13 @@ def build_features(df, inst_df=None, taiex_df=None, sentiment_score=0.0):
     if inst_df is not None and not inst_df.empty:
         d = d.merge(inst_df, on="date", how="left").fillna(0)
 
+    # 融資融券淨額
+    if margin_df is not None and not margin_df.empty:
+        d = d.merge(margin_df, on="date", how="left")
+        d["margin_net"] = d["margin_net"].fillna(0)
+    else:
+        d["margin_net"] = 0.0
+
     return d
 
 
@@ -242,6 +273,86 @@ def predict_xgb(df, inst_df=None, taiex_df=None, sentiment_score=0.0, days=5):
         last_row[feature_cols.index("ret1")] = (pred_price - float(d["close"].iloc[-1])) / float(d["close"].iloc[-1])
 
     return predictions
+
+
+def get_stock_winrate_map():
+    conn = sqlite3.connect(DB_PATH)
+    one_month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    rows = conn.execute("""
+        SELECT stock_id,
+               SUM(CASE WHEN is_correct=1 THEN 1.0 ELSE 0 END) /
+               NULLIF(SUM(CASE WHEN is_correct IS NOT NULL THEN 1 ELSE 0 END), 0)
+        FROM predictions WHERE date >= ? GROUP BY stock_id
+    """, (one_month_ago,)).fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows if r[1] is not None}
+
+
+def get_taiex_daily_change():
+    try:
+        df = fetch_taiex()
+        if df is not None and len(df) >= 2:
+            c = df["close"].values
+            return (float(c[-1]) - float(c[-2])) / float(c[-2])
+    except Exception:
+        pass
+    return 0.0
+
+
+def predict_with_confidence(df, inst_df=None, taiex_df=None, margin_df=None,
+                             sentiment_score=0.0, stock_winrate=None):
+    d = build_features(df, inst_df, taiex_df, sentiment_score, margin_df)
+
+    base_cols = ["MA5", "MA20", "MA60", "RSI", "MACD", "Signal",
+                 "BB_pct", "ret1", "ret5", "ret20",
+                 "vol_ratio", "ma5_20", "price_ma20",
+                 "weekday", "sentiment", "taiex_ret", "margin_net"]
+    inst_cols = [c for c in d.columns if c.startswith("inst_")]
+    feature_cols = base_cols + inst_cols
+
+    d = d.replace([np.inf, -np.inf], np.nan)
+    d = d.dropna(subset=feature_cols + ["close"])
+
+    N = len(d)
+    horizon = 1
+    if N < 40 + horizon:
+        price = float(df["close"].iloc[-1])
+        return {"price": price, "direction": "up", "confidence": 0.5}
+
+    X_all = d[feature_cols].values
+    closes = d["close"].values
+    X_train = X_all[:N - horizon]
+    y_reg = closes[:N - horizon]
+    y_cls = (closes[horizon:N] > closes[:N - horizon]).astype(int)
+
+    # 根據勝率調整模型複雜度（#1 自適應調參）
+    if stock_winrate is not None and stock_winrate < 0.40:
+        params = dict(max_iter=200, max_depth=3, learning_rate=0.03, min_samples_leaf=8, random_state=42)
+    elif stock_winrate is not None and stock_winrate > 0.60:
+        params = dict(max_iter=400, max_depth=5, learning_rate=0.05, min_samples_leaf=4, random_state=42)
+    else:
+        params = dict(max_iter=300, max_depth=4, learning_rate=0.05, min_samples_leaf=5, random_state=42)
+
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    X_scaled = scaler_X.fit_transform(X_train)
+    y_reg_scaled = scaler_y.fit_transform(y_reg.reshape(-1, 1)).flatten()
+
+    reg = HistGradientBoostingRegressor(**params)
+    reg.fit(X_scaled, y_reg_scaled)
+
+    clf = HistGradientBoostingClassifier(**params)
+    clf.fit(X_scaled, y_cls)
+
+    X_last = scaler_X.transform(X_all[-1:])
+    pred_price = float(scaler_y.inverse_transform(reg.predict(X_last).reshape(-1, 1))[0][0])
+    proba = clf.predict_proba(X_last)[0]
+    confidence = float(max(proba))
+    direction = "up" if proba[1] > proba[0] else "down"
+    if confidence < 0.55:
+        direction = "neutral"
+
+    return {"price": round(pred_price, 2), "direction": direction, "confidence": round(confidence, 2)}
 
 
 # --- Real-time price ---
@@ -357,34 +468,44 @@ def run_daily_predictions():
     conn = sqlite3.connect(DB_PATH)
 
     taiex_df = fetch_taiex()
+    taiex_change = get_taiex_daily_change()
+    winrate_map = get_stock_winrate_map()
+
+    if taiex_change < -0.02:
+        print(f"[{today}] ⚠️ 大盤今日下跌 {abs(taiex_change)*100:.1f}%，預測信心度降低")
+
     for stock in favorites:
         try:
             df = fetch_stock_data(stock["id"])
             if df.empty or len(df) < 40:
                 continue
             inst_df = fetch_institutional(stock["id"])
+            margin_df = fetch_margin_data(stock["id"])
             news = fetch_news_sentiment(stock["id"], stock["name"])
             sentiment = news.get("score", 0.0)
             current_price = float(df["close"].iloc[-1])
-            preds = predict_xgb(df, inst_df=inst_df, taiex_df=taiex_df, sentiment_score=sentiment, days=1)
-            predicted_price = round(preds[0], 2)
-            direction = "up" if predicted_price > current_price else "down"
+            wr = winrate_map.get(stock["id"])
+            result = predict_with_confidence(df, inst_df=inst_df, taiex_df=taiex_df,
+                                             margin_df=margin_df, sentiment_score=sentiment,
+                                             stock_winrate=wr)
+            predicted_price = result["price"]
+            direction = result["direction"]
+            confidence = result["confidence"]
 
             conn.execute("""
                 INSERT OR IGNORE INTO predictions
-                (date, stock_id, stock_name, current_price, predicted_price, predicted_direction)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (today, stock["id"], stock["name"], current_price, predicted_price, direction))
+                (date, stock_id, stock_name, current_price, predicted_price, predicted_direction, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (today, stock["id"], stock["name"], current_price, predicted_price, direction, confidence))
             conn.commit()
 
-            # 重置已觸發的停損/目標（每日重置）
             conn.execute("""
                 UPDATE stop_loss SET stop_triggered=0, target_triggered=0
                 WHERE stock_id=?
             """, (stock["id"],))
             conn.commit()
 
-            print(f"[{today}] {stock['name']} 預測完成: {current_price} → {predicted_price} ({direction})")
+            print(f"[{today}] {stock['name']} 預測完成: {current_price} → {predicted_price} ({direction} {confidence*100:.0f}%)")
         except Exception as e:
             print(f"[{today}] {stock['name']} 錯誤: {e}")
 
@@ -558,20 +679,33 @@ def predict_and_report_single(stock_id: str):
             send_telegram(f"❌ {stock_name}（{stock_id}）資料不足，無法預測")
             return
         taiex_df = fetch_taiex()
+        taiex_change = get_taiex_daily_change()
         inst_df = fetch_institutional(stock_id)
+        margin_df = fetch_margin_data(stock_id)
         news = fetch_news_sentiment(stock_id, stock_name)
         sentiment = news.get("score", 0.0)
         current_price = float(df["close"].iloc[-1])
-        preds = predict_xgb(df, inst_df=inst_df, taiex_df=taiex_df, sentiment_score=sentiment, days=1)
-        predicted_price = round(preds[0], 2)
-        direction = "up" if predicted_price > current_price else "down"
-        arrow = "↑" if direction == "up" else "↓"
+        wr_map = get_stock_winrate_map()
+        result = predict_with_confidence(df, inst_df=inst_df, taiex_df=taiex_df,
+                                         margin_df=margin_df, sentiment_score=sentiment,
+                                         stock_winrate=wr_map.get(stock_id))
+        predicted_price = result["price"]
+        direction = result["direction"]
+        confidence = result["confidence"]
+
+        if direction == "neutral":
+            arrow, dir_text = "⚠️", f"方向不明（信心度 {confidence*100:.0f}%）"
+        else:
+            arrow = "↑" if direction == "up" else "↓"
+            dir_text = f"{'看漲' if direction == 'up' else '看跌'}（信心度 {confidence*100:.0f}%）"
+
         sentiment_text = f"\n📰 新聞情緒：{news.get('label', '')}" if news.get("label") else ""
+        market_warning = f"\n⚠️ 大盤今跌 {abs(taiex_change)*100:.1f}%，請謹慎" if taiex_change < -0.02 else ""
         send_telegram(
             f"📊 <b>{stock_name}（{stock_id}）預測</b>\n\n"
             f"目前價格：{current_price}\n"
-            f"預測方向：{arrow} {'看漲' if direction == 'up' else '看跌'}\n"
-            f"預測價格：<b>{predicted_price}</b>{sentiment_text}\n\n"
+            f"預測方向：{arrow} {dir_text}\n"
+            f"預測價格：<b>{predicted_price}</b>{sentiment_text}{market_warning}\n\n"
             f"🤖 AI 預測僅供參考，投資請謹慎"
         )
     except Exception as e:
@@ -615,11 +749,11 @@ def send_morning_report():
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT p.stock_name, p.stock_id, p.current_price, p.predicted_price, p.predicted_direction,
-               n.label, n.sentiment_score
+               n.label, p.confidence
         FROM predictions p
         LEFT JOIN news_cache n ON p.stock_id = n.stock_id
         WHERE p.date = ?
-        ORDER BY p.stock_id
+        ORDER BY p.confidence DESC NULLS LAST, p.stock_id
     """, (today,)).fetchall()
     conn.close()
 
@@ -627,22 +761,34 @@ def send_morning_report():
         send_telegram(f"📊 <b>{today} 股票預測</b>\n\n今日尚無預測資料，請先執行預測。")
         return
 
+    taiex_change = get_taiex_daily_change()
     up_list = [r for r in rows if r[4] == "up"]
     down_list = [r for r in rows if r[4] == "down"]
+    neutral_list = [r for r in rows if r[4] == "neutral"]
 
     lines = [f"📊 <b>{today} 每日股票預測報告</b>\n"]
-    lines.append(f"看漲 {len(up_list)} 支 ｜ 看跌 {len(down_list)} 支\n")
+    if taiex_change < -0.02:
+        lines.append(f"⚠️ 大盤今跌 {abs(taiex_change)*100:.1f}%，預測信心度參考性降低\n")
+    lines.append(f"看漲 {len(up_list)} 支 ｜ 看跌 {len(down_list)} 支 ｜ 中性 {len(neutral_list)} 支\n")
     lines.append("─────────────────────")
+
+    def fmt_row(r, arrow):
+        conf = f" [{r[6]*100:.0f}%]" if r[6] is not None else ""
+        sentiment = f" 【{r[5]}】" if r[5] else ""
+        return f"  {arrow} {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{conf}{sentiment}"
 
     lines.append("\n📈 <b>看漲</b>")
     for r in up_list:
-        sentiment = f" 【新聞:{r[5]}】" if r[5] else ""
-        lines.append(f"  ↑ {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{sentiment}")
+        lines.append(fmt_row(r, "↑"))
 
     lines.append("\n📉 <b>看跌</b>")
     for r in down_list:
-        sentiment = f" 【新聞:{r[5]}】" if r[5] else ""
-        lines.append(f"  ↓ {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{sentiment}")
+        lines.append(fmt_row(r, "↓"))
+
+    if neutral_list:
+        lines.append("\n⚠️ <b>方向不明</b>")
+        for r in neutral_list:
+            lines.append(fmt_row(r, "—"))
 
     lines.append("\n─────────────────────")
     lines.append("🤖 AI 預測僅供參考，投資請謹慎")
@@ -833,6 +979,8 @@ scheduler.add_job(run_daily_predictions, "cron", hour=18, minute=0)
 scheduler.add_job(send_morning_report, "cron", hour=8, minute=0)
 scheduler.add_job(check_stop_loss, "cron", minute="*/30")
 scheduler.add_job(update_actual_prices, "cron", hour=9, minute=30)
+# 每週日深度重訓（使用 2 年資料，同時驗證並更新勝率）
+scheduler.add_job(run_daily_predictions, "cron", day_of_week="sun", hour=1, minute=0)
 scheduler.start()
 
 # 啟動時補算尚未驗證的預測
