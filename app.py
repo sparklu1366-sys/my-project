@@ -632,7 +632,7 @@ def update_actual_prices():
     rows = conn.execute("""
         SELECT id, date, stock_id, predicted_direction
         FROM predictions
-        WHERE actual_price IS NULL AND date < date('now', 'localtime')
+        WHERE actual_price IS NULL AND date <= date('now', 'localtime')
     """).fetchall()
 
     for row in rows:
@@ -1169,19 +1169,18 @@ def handle_telegram_commands():
 
 
 # --- Scheduler ---
-scheduler = BackgroundScheduler()
-scheduler.add_job(run_daily_predictions, "cron", hour=18, minute=0)
-scheduler.add_job(send_morning_report, "cron", hour=8, minute=0)
-scheduler.add_job(check_stop_loss, "cron", minute="*/30")
-scheduler.add_job(update_actual_prices, "cron", hour=9, minute=30)
-# 14:00 收盤後準確度報告
-scheduler.add_job(send_accuracy_report, "cron", hour=14, minute=0)
-# 每週日深度重訓（使用 2 年資料，同時驗證並更新勝率）
-scheduler.add_job(run_daily_predictions, "cron", day_of_week="sun", hour=1, minute=0)
-scheduler.start()
+def morning_routine():
+    """08:00 產預測 → 發晨報"""
+    run_daily_predictions()
+    send_morning_report()
 
-# 啟動時補算尚未驗證的預測
-threading.Thread(target=update_actual_prices, daemon=True).start()
+scheduler = BackgroundScheduler()
+scheduler.add_job(morning_routine, "cron", hour=8, minute=0)          # 08:00 產預測+晨報
+scheduler.add_job(send_accuracy_report, "cron", hour=14, minute=0)    # 14:00 收盤準確度
+scheduler.add_job(check_stop_loss, "cron", minute="*/30")             # 每 30 分鐘停損檢查
+# 每週日 01:00 深度重訓
+scheduler.add_job(morning_routine, "cron", day_of_week="sun", hour=1, minute=0)
+scheduler.start()
 
 # 啟動 Telegram 指令監聽（設定 DISABLE_TELEGRAM=1 可停用，用於本機開發）
 if not os.environ.get("DISABLE_TELEGRAM"):
@@ -1303,9 +1302,8 @@ async def remove_favorite(stock_id: str):
 
 @app.post("/favorites/predict-now")
 async def predict_now():
-    run_daily_predictions()
-    send_morning_report()
-    return {"status": "ok", "message": "預測完成並已發送 Telegram"}
+    threading.Thread(target=morning_routine, daemon=True).start()
+    return {"status": "ok", "message": "預測執行中，完成後將發送 Telegram"}
 
 
 @app.post("/notify/test")
