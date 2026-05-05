@@ -26,6 +26,7 @@ body { font-family: Arial, sans-serif; background: #0f1117; color: #e0e0e0; font
 .card .value { font-size: 32px; font-weight: bold; color: #00d4ff; }
 .card .value.up { color: #00e676; }
 .card .value.down { color: #ff5252; }
+.card .value.neutral { color: #ffd54f; }
 .chart-box { background: #1a1d27; border-radius: 10px; padding: 20px; margin-bottom: 18px; border: 1px solid #2d3048; }
 .chart-box h3 { margin-bottom: 14px; color: #aaa; font-size: 16px; }
 .loading { text-align: center; padding: 50px; color: #888; font-size: 18px; display: none; }
@@ -132,6 +133,7 @@ tr:last-child td { border-bottom: none; }
         <div class="card"><div class="label">目前股價</div><div class="value" id="currentPrice">-</div></div>
         <div class="card"><div class="label">明日預測</div><div class="value" id="predPrice">-</div></div>
         <div class="card"><div class="label">趨勢判斷</div><div class="value" id="trend">-</div></div>
+        <div class="card"><div class="label">AI 信心度</div><div class="value" id="confidenceBar">-</div></div>
       </div>
       <div class="chart-box"><h3>股價走勢 + MA5/MA20 + AI 預測未來 5 天</h3><div id="priceChart"></div></div>
       <div class="chart-box"><h3>RSI 指標（>70 超買 / <30 超賣）</h3><div id="rsiChart"></div></div>
@@ -225,7 +227,20 @@ async function analyzeSingle() {
   document.getElementById("predPrice").textContent = data.pred_price;
   const trendEl = document.getElementById("trend");
   trendEl.textContent = data.trend;
-  trendEl.className = "value " + (data.trend.includes("↑") ? "up" : "down");
+  const dir = data.direction || (data.trend.includes("↑") ? "up" : "down");
+  trendEl.className = "value " + (dir === "up" ? "up" : dir === "down" ? "down" : "neutral");
+  const conf = data.confidence != null ? data.confidence : null;
+  const confEl = document.getElementById("confidenceBar");
+  if (conf != null) {
+    const pct = Math.round(conf * 100);
+    const color = conf >= 0.65 ? "#00e676" : conf >= 0.55 ? "#ffd54f" : "#ff5252";
+    confEl.innerHTML = `<span style="color:${color};font-size:1.2em;font-weight:bold">${pct}%</span>
+      <div style="background:#2d3048;border-radius:4px;height:6px;margin-top:4px">
+        <div style="width:${pct}%;background:${color};height:6px;border-radius:4px;transition:width .4s"></div>
+      </div>`;
+  } else {
+    confEl.textContent = "-";
+  }
   Plotly.newPlot("priceChart", [
     {x: data.dates, y: data.close, name: "收盤價", line: {color: "#00d4ff"}},
     {x: data.dates, y: data.ma5, name: "MA5", line: {color: "#ffd54f", dash: "dot"}},

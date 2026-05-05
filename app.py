@@ -1020,15 +1020,27 @@ async def analyze(req: StockRequest):
         if df.empty:
             return {"error": "找不到此股票代碼"}
         inst_df = fetch_institutional(req.stock_id)
+        margin_df = fetch_margin_data(req.stock_id)
         taiex_df = fetch_taiex()
         news = fetch_news_sentiment(req.stock_id, req.stock_id)
         sentiment = news.get("score", 0.0)
         df = calc_indicators(df)
         recent = df.tail(60).copy()
         predictions = predict_xgb(df, inst_df=inst_df, taiex_df=taiex_df, sentiment_score=sentiment)
+        wr_map = get_stock_winrate_map()
+        clf_result = predict_with_confidence(df, inst_df=inst_df, taiex_df=taiex_df,
+                                              margin_df=margin_df, sentiment_score=sentiment,
+                                              stock_winrate=wr_map.get(req.stock_id))
+        direction = clf_result["direction"]
+        confidence = clf_result["confidence"]
         last_date = pd.to_datetime(df["date"].iloc[-1])
         future_dates = [(last_date + timedelta(days=i+1)).strftime("%Y-%m-%d") for i in range(5)]
         close = recent["close"].tolist()
+        if direction == "neutral":
+            trend_text = f"⚠️ 方向不明（{confidence*100:.0f}%）"
+        else:
+            arrow = "↑" if direction == "up" else "↓"
+            trend_text = f"{arrow} {'看漲' if direction == 'up' else '看跌'}（{confidence*100:.0f}%）"
         return {
             "stock_id": req.stock_id,
             "dates": recent["date"].astype(str).tolist(),
@@ -1042,7 +1054,9 @@ async def analyze(req: StockRequest):
             "predictions": predictions,
             "current_price": close[-1],
             "pred_price": round(predictions[0], 2),
-            "trend": "↑ 看漲" if predictions[0] > close[-1] else "↓ 看跌"
+            "trend": trend_text,
+            "confidence": confidence,
+            "direction": direction,
         }
     except Exception as e:
         return {"error": str(e)}
