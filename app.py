@@ -920,6 +920,72 @@ def send_morning_report():
     send_telegram("\n".join(lines))
 
 
+def send_accuracy_report():
+    """14:00 收盤後：先更新實際價格，再發送昨日預測準確度報告。"""
+    update_actual_prices()
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    # 取昨日或今日最近一批有驗證結果的預測
+    rows = conn.execute("""
+        SELECT stock_name, stock_id, predicted_direction, actual_direction,
+               is_correct, current_price, actual_price
+        FROM predictions
+        WHERE date IN (?, ?)
+          AND is_correct IS NOT NULL
+        ORDER BY date DESC, stock_id
+    """, (today, yesterday)).fetchall()
+
+    overall = conn.execute("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END)
+        FROM predictions
+        WHERE date >= date('now','localtime','-30 days')
+          AND is_correct IS NOT NULL
+    """).fetchone()
+    conn.close()
+
+    if not rows:
+        send_telegram("📊 <b>收盤準確度報告</b>\n\n尚無已驗證的預測結果，資料可能仍在更新中。")
+        return
+
+    total_judged = len(rows)
+    correct = sum(1 for r in rows if r[4] == 1)
+    today_rate = round(correct / total_judged * 100, 1) if total_judged else 0
+
+    ov_total = overall[0] or 0
+    ov_correct = overall[1] or 0
+    ov_rate = round(ov_correct / ov_total * 100, 1) if ov_total > 0 else None
+
+    lines = [f"📊 <b>今日收盤預測準確度報告</b>\n"]
+    lines.append(f"今日命中：{correct}/{total_judged}（{today_rate}%）")
+    if ov_rate is not None:
+        lines.append(f"近 30 日勝率：{ov_rate}%（{ov_correct}/{ov_total} 筆）\n")
+    lines.append("─────────────────────")
+
+    correct_rows = [r for r in rows if r[4] == 1]
+    wrong_rows   = [r for r in rows if r[4] == 0]
+
+    if correct_rows:
+        lines.append("\n✅ <b>預測正確</b>")
+        for r in correct_rows:
+            arrow = "↑" if r[2] == "up" else "↓"
+            chg = f"{r[6]:.0f}" if r[6] else "?"
+            lines.append(f"  {arrow} {r[0]}({r[1]})  實際:{chg}")
+
+    if wrong_rows:
+        lines.append("\n❌ <b>預測錯誤</b>")
+        for r in wrong_rows:
+            pred_arrow = "↑" if r[2] == "up" else "↓"
+            actual_arrow = "↑" if r[3] == "up" else "↓"
+            lines.append(f"  {pred_arrow}→{actual_arrow} {r[0]}({r[1]})")
+
+    lines.append("\n─────────────────────")
+    lines.append("🤖 持續學習中，勝率將逐步提升")
+    send_telegram("\n".join(lines))
+
+
 # --- Telegram command handler ---
 _last_update_id = 0
 
@@ -927,6 +993,7 @@ HELP_TEXT = """📋 <b>可用指令</b>
 
 /預測 — 立即執行預測並發送報告
 /報告 — 發送今日預測報告
+/勝率 — 今日收盤準確度報告
 /檢查 — 立即檢查停損價
 /新聞 2330 — 查詢股票新聞情緒
 /加入 2330 — 新增自選股
@@ -1024,6 +1091,9 @@ def handle_telegram_commands():
                     lines = [f"• {s['name']}（{s['id']}）" for s in stocks]
                     send_telegram(f"⭐ <b>自選股清單（{len(stocks)} 支）</b>\n\n" + "\n".join(lines))
 
+                elif cmd in ["/勝率", "/accuracy"]:
+                    send_accuracy_report()
+
                 elif cmd in ["/說明", "/help"]:
                     send_telegram(HELP_TEXT)
 
@@ -1104,6 +1174,8 @@ scheduler.add_job(run_daily_predictions, "cron", hour=18, minute=0)
 scheduler.add_job(send_morning_report, "cron", hour=8, minute=0)
 scheduler.add_job(check_stop_loss, "cron", minute="*/30")
 scheduler.add_job(update_actual_prices, "cron", hour=9, minute=30)
+# 14:00 收盤後準確度報告
+scheduler.add_job(send_accuracy_report, "cron", hour=14, minute=0)
 # 每週日深度重訓（使用 2 年資料，同時驗證並更新勝率）
 scheduler.add_job(run_daily_predictions, "cron", day_of_week="sun", hour=1, minute=0)
 scheduler.start()
