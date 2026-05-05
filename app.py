@@ -81,6 +81,15 @@ def init_db():
             updated_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS holdings (
+            stock_id TEXT PRIMARY KEY,
+            stock_name TEXT NOT NULL,
+            lots INTEGER NOT NULL DEFAULT 1,
+            buy_price REAL NOT NULL,
+            added_at TEXT DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
     conn.commit()
     try:
         conn.execute("ALTER TABLE predictions ADD COLUMN confidence REAL")
@@ -437,8 +446,14 @@ def predict_with_confidence(df, inst_df=None, taiex_df=None, margin_df=None,
         except Exception:
             pass
 
-    # 混合模型信心度（60%）與驗證準確率（40%）
-    confidence = round(raw_confidence * 0.6 + wf_accuracy * 0.4, 2)
+    # 依歷史勝率動態調整混合權重
+    if stock_winrate is not None and stock_winrate > 0.60:
+        model_weight, wf_weight = 0.70, 0.30  # 模型準確時，更信任模型
+    elif stock_winrate is not None and stock_winrate < 0.40:
+        model_weight, wf_weight = 0.50, 0.50  # 模型不穩時，加重驗證準確率
+    else:
+        model_weight, wf_weight = 0.60, 0.40
+    confidence = round(raw_confidence * model_weight + wf_accuracy * wf_weight, 2)
     if confidence < 0.55:
         direction = "neutral"
 
@@ -563,6 +578,10 @@ def check_stop_loss():
         if stop_price and not stop_triggered and price <= stop_price:
             alerts.append(f"🚨 <b>停損警報</b>\n{stock_name}({stock_id})\n現價 <b>{price}</b> 已跌破停損價 {stop_price}")
             conn.execute("UPDATE stop_loss SET stop_triggered=1 WHERE stock_id=?", (stock_id,))
+        elif stop_price and not stop_triggered and price > stop_price:
+            pct_to_stop = (price - stop_price) / price
+            if pct_to_stop <= 0.03:
+                alerts.append(f"⚠️ <b>接近停損</b>\n{stock_name}({stock_id})\n現價 <b>{price}</b>，距停損價 {stop_price} 僅剩 {pct_to_stop*100:.1f}%")
 
         if target_price and not target_triggered and price >= target_price:
             alerts.append(f"🎯 <b>目標達成</b>\n{stock_name}({stock_id})\n現價 <b>{price}</b> 已達目標價 {target_price}")
@@ -832,6 +851,43 @@ def predict_and_report_single(stock_id: str):
         send_telegram(f"❌ 分析 {stock_name}（{stock_id}）失敗：{e}")
 
 
+def get_stock_current_price(stock_id: str) -> float | None:
+    try:
+        ticker = yf.Ticker(f"{stock_id}.TW")
+        hist = ticker.history(period="2d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
+def get_holdings() -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM holdings ORDER BY added_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_holding(stock_id: str, stock_name: str, lots: int, buy_price: float):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO holdings (stock_id, stock_name, lots, buy_price) VALUES (?, ?, ?, ?)",
+        (stock_id, stock_name, lots, buy_price)
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_holding(stock_id: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("DELETE FROM holdings WHERE stock_id = ?", (stock_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
 def send_telegram(message: str):
     cfg = load_config()["telegram"]
     url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
@@ -898,9 +954,10 @@ def send_morning_report():
         wr = wr_map.get(r[1])
         pos = calc_position_size(conf, r[4], winrate=wr, taiex_change=taiex_change)
         conf_str = f" [{conf*100:.0f}%]" if conf else ""
+        wr_str = f" 勝率{wr*100:.0f}%" if wr is not None else ""
         pos_str = f" 【{pos['label']}】" if pos["ratio"] > 0 else " 【不進場】"
         sentiment = f" {r[5]}" if r[5] else ""
-        return f"  {arrow} {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{conf_str}{pos_str}{sentiment}"
+        return f"  {arrow} {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{conf_str}{wr_str}{pos_str}{sentiment}"
 
     lines.append("\n📈 <b>看漲</b>")
     for r in up_list:
@@ -999,6 +1056,9 @@ HELP_TEXT = """📋 <b>可用指令</b>
 /加入 2330 — 新增自選股
 /刪除 2330 — 刪除自選股
 /清單 — 顯示目前自選股
+/持股 — 查看持股損益
+/持股 新增 2330 1 850 — 新增持股（張數 買進均價）
+/持股 刪除 2330 — 刪除持股
 /說明 — 顯示此說明"""
 
 
@@ -1093,6 +1153,62 @@ def handle_telegram_commands():
 
                 elif cmd in ["/勝率", "/accuracy"]:
                     send_accuracy_report()
+
+                elif cmd in ["/持股", "/holdings"]:
+                    sub = parts[1] if len(parts) > 1 else ""
+                    if sub == "新增" and len(parts) >= 5:
+                        h_id = parts[2]
+                        try:
+                            h_lots = int(parts[3])
+                            h_price = float(parts[4])
+                        except ValueError:
+                            send_telegram("❌ 格式錯誤，請用：/持股 新增 2330 1 850")
+                            continue
+                        try:
+                            api = DataLoader()
+                            df_info = api.taiwan_stock_info()
+                            row = df_info[df_info["stock_id"] == h_id]
+                            h_name = str(row["stock_name"].iloc[0]) if not row.empty else h_id
+                        except Exception:
+                            h_name = h_id
+                        add_holding(h_id, h_name, h_lots, h_price)
+                        send_telegram(f"✅ 已新增持股：{h_name}（{h_id}）{h_lots} 張 @ {h_price}")
+                    elif sub == "刪除" and len(parts) >= 3:
+                        h_id = parts[2]
+                        if remove_holding(h_id):
+                            send_telegram(f"✅ 已刪除持股：{h_id}")
+                        else:
+                            send_telegram(f"⚠️ 找不到持股：{h_id}")
+                    else:
+                        rows = get_holdings()
+                        if not rows:
+                            send_telegram("📭 目前沒有持股記錄\n\n新增：/持股 新增 2330 1 850")
+                        else:
+                            lines = []
+                            total_pnl = 0.0
+                            for h in rows:
+                                price_now = get_stock_current_price(h["stock_id"])
+                                if price_now:
+                                    pnl = (price_now - h["buy_price"]) * h["lots"] * 1000
+                                    pnl_pct = (price_now - h["buy_price"]) / h["buy_price"] * 100
+                                    sign = "+" if pnl >= 0 else ""
+                                    lines.append(
+                                        f"• {h['stock_name']}（{h['stock_id']}）{h['lots']}張\n"
+                                        f"  買進：{h['buy_price']} → 現價：{price_now:.1f}\n"
+                                        f"  損益：{sign}{pnl:,.0f}元（{sign}{pnl_pct:.1f}%）"
+                                    )
+                                    total_pnl += pnl
+                                else:
+                                    lines.append(
+                                        f"• {h['stock_name']}（{h['stock_id']}）{h['lots']}張 @ {h['buy_price']}\n"
+                                        f"  （無法取得即時價格）"
+                                    )
+                            sign = "+" if total_pnl >= 0 else ""
+                            send_telegram(
+                                f"💼 <b>持股損益（{len(rows)} 支）</b>\n\n"
+                                + "\n\n".join(lines)
+                                + f"\n\n📊 總損益：{sign}{total_pnl:,.0f} 元"
+                            )
 
                 elif cmd in ["/說明", "/help"]:
                     send_telegram(HELP_TEXT)
@@ -1202,6 +1318,12 @@ class StopLossRequest(BaseModel):
     stock_name: str
     stop_price: float = None
     target_price: float = None
+
+class HoldingRequest(BaseModel):
+    stock_id: str
+    stock_name: str
+    lots: int
+    buy_price: float
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1347,6 +1469,29 @@ async def delete_stop_loss(stock_id: str):
 async def check_now():
     check_stop_loss()
     return {"status": "ok"}
+
+
+# --- Holdings API ---
+@app.get("/holdings")
+async def get_holdings_api():
+    rows = get_holdings()
+    result = []
+    for h in rows:
+        price_now = get_stock_current_price(h["stock_id"])
+        pnl = round((price_now - h["buy_price"]) * h["lots"] * 1000, 2) if price_now else None
+        pnl_pct = round((price_now - h["buy_price"]) / h["buy_price"] * 100, 2) if price_now else None
+        result.append({**h, "current_price": price_now, "pnl": pnl, "pnl_pct": pnl_pct})
+    return result
+
+@app.post("/holdings")
+async def add_holding_api(req: HoldingRequest):
+    add_holding(req.stock_id, req.stock_name, req.lots, req.buy_price)
+    return {"status": "ok"}
+
+@app.delete("/holdings/{stock_id}")
+async def delete_holding_api(stock_id: str):
+    ok = remove_holding(stock_id)
+    return {"status": "ok" if ok else "not_found"}
 
 
 # --- News API ---
