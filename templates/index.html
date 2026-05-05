@@ -147,7 +147,7 @@ tr:last-child td { border-bottom: none; }
     <div class="fav-header">
       <h2 id="favTitle">我的最愛</h2>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn-secondary" onclick="refreshNews()">更新新聞情緒</button>
+        <button class="btn-secondary" onclick="refreshNews(this)">更新新聞情緒</button>
         <button class="btn-edit" id="editBtn" onclick="toggleEdit()">編輯清單</button>
         <button class="btn-predict" id="predictBtn" onclick="runPredictions()">立即執行今日預測</button>
       </div>
@@ -313,8 +313,7 @@ async function removeStock(stockId) {
   loadFavorites();
 }
 
-async function refreshNews() {
-  const btn = event.target;
+async function refreshNews(btn) {
   btn.textContent = "更新中...";
   btn.disabled = true;
   await fetch("/news/refresh-all", {method: "POST"});
@@ -403,65 +402,81 @@ async function runPredictions() {
 }
 
 // --- 停損提醒 ---
+let _slStocks = [];
+
 async function loadStopLoss() {
-  const [stocks, slData] = await Promise.all([
-    fetch("/favorites").then(r => r.json()),
-    fetch("/stop-loss").then(r => r.json())
-  ]);
-
-  // 用 data-* 屬性存名稱，避免單引號/特殊字元破壞 onclick
-  document.getElementById("slGrid").innerHTML = stocks.map(s => {
-    const sl = slData[s.id] || {};
-    const triggered = sl.stop_triggered || sl.target_triggered;
-    return `<div class="sl-card ${triggered ? "triggered" : ""}">
-      <div class="sl-name">${s.name} <span style="font-size:12px;color:#555;font-weight:normal">${s.id}</span>
-        ${triggered ? " 🚨" : ""}
-      </div>
-      <label>停損價（跌破時通知）</label>
-      <input type="number" id="stop_${s.id}" placeholder="例如 850" step="0.5" value="${sl.stop_price || ""}">
-      <label>目標價（達到時通知）</label>
-      <input type="number" id="target_${s.id}" placeholder="例如 1000" step="0.5" value="${sl.target_price || ""}">
-      <div class="sl-btns">
-        <button class="btn-save" data-id="${s.id}" data-name="${s.name.replace(/"/g,'&quot;')}" onclick="saveStopLoss(this)">儲存</button>
-        <button class="btn-clear" data-id="${s.id}" onclick="clearStopLoss(this)">清除</button>
-      </div>
-    </div>`;
-  }).join("");
-}
-
-async function saveStopLoss(btn) {
-  const stockId = btn.dataset.id;
-  const stockName = btn.dataset.name;
-  const stopPrice = parseFloat(document.getElementById(`stop_${stockId}`).value) || null;
-  const targetPrice = parseFloat(document.getElementById(`target_${stockId}`).value) || null;
-  btn.textContent = "儲存中..."; btn.disabled = true;
+  const grid = document.getElementById("slGrid");
+  grid.innerHTML = "載入中...";
   try {
-    const res = await fetch("/stop-loss", {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({stock_id: stockId, stock_name: stockName, stop_price: stopPrice, target_price: targetPrice})
-    });
-    if (!res.ok) throw new Error(res.status);
-    btn.textContent = "✓ 已儲存";
-    setTimeout(() => { btn.textContent = "儲存"; btn.disabled = false; }, 1500);
-    loadStopLoss();
+    const [stocks, slData] = await Promise.all([
+      fetch("/favorites").then(r => r.json()),
+      fetch("/stop-loss").then(r => r.json())
+    ]);
+    _slStocks = stocks;
+    grid.innerHTML = stocks.length === 0
+      ? "<p style='color:#888'>尚無自選股</p>"
+      : stocks.map(s => {
+          const sl = slData[s.id] || {};
+          const triggered = sl.stop_triggered || sl.target_triggered;
+          return `<div class="sl-card ${triggered ? "triggered" : ""}" data-id="${s.id}" data-name="${s.name}">
+            <div class="sl-name">${s.name} <span style="font-size:12px;color:#555;font-weight:normal">${s.id}</span>${triggered ? " 🚨" : ""}</div>
+            <label>停損價（跌破時通知）</label>
+            <input type="number" class="sl-stop" placeholder="例如 850" step="0.5" value="${sl.stop_price || ""}">
+            <label>目標價（達到時通知）</label>
+            <input type="number" class="sl-target" placeholder="例如 1000" step="0.5" value="${sl.target_price || ""}">
+            <div class="sl-btns">
+              <button class="btn-save" data-action="save">儲存</button>
+              <button class="btn-clear" data-action="clear">清除</button>
+            </div>
+          </div>`;
+        }).join("");
   } catch(e) {
-    btn.textContent = "❌ 失敗";
-    setTimeout(() => { btn.textContent = "儲存"; btn.disabled = false; }, 2000);
+    grid.innerHTML = `<p style="color:#ff5252">載入失敗：${e.message}</p>`;
   }
 }
 
-async function clearStopLoss(btn) {
-  const stockId = btn.dataset.id;
-  btn.textContent = "清除中..."; btn.disabled = true;
-  try {
-    await fetch(`/stop-loss/${stockId}`, {method: "DELETE"});
-    loadStopLoss();
-  } catch(e) {
-    btn.textContent = "❌ 失敗";
-    setTimeout(() => { btn.textContent = "清除"; btn.disabled = false; }, 2000);
-  }
-}
+// event delegation — 一個監聽器處理所有卡片的按鈕
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("slGrid").addEventListener("click", async e => {
+    const action = e.target.dataset.action;
+    if (!action) return;
+    const card = e.target.closest(".sl-card");
+    if (!card) return;
+    const stockId   = card.dataset.id;
+    const stockName = card.dataset.name;
+    const btn = e.target;
+
+    if (action === "save") {
+      const stopPrice   = parseFloat(card.querySelector(".sl-stop").value)   || null;
+      const targetPrice = parseFloat(card.querySelector(".sl-target").value) || null;
+      btn.textContent = "儲存中..."; btn.disabled = true;
+      try {
+        const res = await fetch("/stop-loss", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({stock_id: stockId, stock_name: stockName, stop_price: stopPrice, target_price: targetPrice})
+        });
+        if (!res.ok) throw new Error(res.status);
+        btn.textContent = "✓ 已儲存";
+        setTimeout(() => { btn.textContent = "儲存"; btn.disabled = false; }, 1500);
+      } catch(err) {
+        btn.textContent = "❌ 失敗";
+        setTimeout(() => { btn.textContent = "儲存"; btn.disabled = false; }, 2000);
+      }
+    }
+
+    if (action === "clear") {
+      btn.textContent = "清除中..."; btn.disabled = true;
+      try {
+        await fetch(`/stop-loss/${stockId}`, {method: "DELETE"});
+        await loadStopLoss();
+      } catch(err) {
+        btn.textContent = "❌ 失敗";
+        setTimeout(() => { btn.textContent = "清除"; btn.disabled = false; }, 2000);
+      }
+    }
+  });
+});
 
 async function checkNow(btn) {
   btn.textContent = "檢查中..."; btn.disabled = true;
