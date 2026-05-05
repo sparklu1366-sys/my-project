@@ -134,6 +134,7 @@ tr:last-child td { border-bottom: none; }
         <div class="card"><div class="label">明日預測</div><div class="value" id="predPrice">-</div></div>
         <div class="card"><div class="label">趨勢判斷</div><div class="value" id="trend">-</div></div>
         <div class="card"><div class="label">AI 信心度</div><div class="value" id="confidenceBar">-</div></div>
+        <div class="card"><div class="label">建議倉位</div><div class="value" id="positionLabel">-</div></div>
       </div>
       <div class="chart-box"><h3>股價走勢 + MA5/MA20 + AI 預測未來 5 天</h3><div id="priceChart"></div></div>
       <div class="chart-box"><h3>RSI 指標（>70 超買 / <30 超賣）</h3><div id="rsiChart"></div></div>
@@ -241,6 +242,12 @@ async function analyzeSingle() {
   } else {
     confEl.textContent = "-";
   }
+  const posEl = document.getElementById("positionLabel");
+  const posLabel = data.position_label || "-";
+  const posRatio = data.position_ratio || 0;
+  const posColor = posRatio >= 1.0 ? "#00e676" : posRatio >= 0.5 ? "#ffd54f" : posRatio > 0 ? "#ff8a65" : "#ff5252";
+  const posReason = data.position_reason ? `<div style="font-size:0.7em;color:#aaa;margin-top:2px">${data.position_reason}</div>` : "";
+  posEl.innerHTML = `<span style="color:${posColor};font-weight:bold">${posLabel}</span>${posReason}`;
   Plotly.newPlot("priceChart", [
     {x: data.dates, y: data.close, name: "收盤價", line: {color: "#00d4ff"}},
     {x: data.dates, y: data.ma5, name: "MA5", line: {color: "#ffd54f", dash: "dot"}},

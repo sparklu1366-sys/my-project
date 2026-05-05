@@ -329,6 +329,40 @@ def get_taiex_daily_change():
     return 0.0
 
 
+# --- C1: 信心度動態倉位建議 ---
+def calc_position_size(confidence: float, direction: str,
+                       winrate: float = None, taiex_change: float = 0.0) -> dict:
+    if direction == "neutral" or confidence < 0.55:
+        return {"ratio": 0.0, "label": "不建議進場", "reason": "方向不明或信心不足"}
+
+    if confidence >= 0.80:
+        ratio = 1.0
+    elif confidence >= 0.65:
+        ratio = 0.5
+    else:
+        ratio = 0.25
+
+    reasons = []
+    if winrate is not None and winrate < 0.40:
+        ratio = max(0.0, ratio - 0.25)
+        reasons.append(f"勝率偏低({winrate*100:.0f}%)降倉")
+    if taiex_change < -0.02:
+        ratio = max(0.0, ratio - 0.25)
+        reasons.append("大盤弱勢降倉")
+
+    if ratio <= 0:
+        return {"ratio": 0.0, "label": "不建議進場", "reason": "、".join(reasons)}
+
+    if ratio >= 1.0:
+        label = "全倉"
+    elif ratio >= 0.5:
+        label = "半倉"
+    else:
+        label = "輕倉"
+
+    return {"ratio": ratio, "label": label, "reason": "、".join(reasons)}
+
+
 def predict_with_confidence(df, inst_df=None, taiex_df=None, margin_df=None,
                              sentiment_score=0.0, stock_winrate=None):
     d = build_features(df, inst_df, taiex_df, sentiment_score, margin_df)
@@ -380,12 +414,35 @@ def predict_with_confidence(df, inst_df=None, taiex_df=None, margin_df=None,
     X_last = scaler_X.transform(X_all[-1:])
     pred_price = float(scaler_y.inverse_transform(reg.predict(X_last).reshape(-1, 1))[0][0])
     proba = clf.predict_proba(X_last)[0]
-    confidence = float(max(proba))
+    raw_confidence = float(max(proba))
     direction = "up" if proba[1] > proba[0] else "down"
+
+    # A1: Walk-forward 時序驗證，校準信心度
+    wf_accuracy = 0.5
+    val_size = max(10, N // 5)
+    train_end = N - horizon - val_size
+    if train_end >= 40:
+        try:
+            X_wf = X_all[:train_end]
+            y_wf_cls = (closes[horizon:train_end + horizon] > closes[:train_end]).astype(int)
+            scaler_wf = MinMaxScaler()
+            X_wf_scaled = scaler_wf.fit_transform(X_wf)
+            clf_wf = HistGradientBoostingClassifier(**params)
+            clf_wf.fit(X_wf_scaled, y_wf_cls)
+            X_val = scaler_wf.transform(X_all[train_end:N - horizon])
+            y_val = (closes[train_end + horizon:N] > closes[train_end:N - horizon]).astype(int)
+            if len(y_val) > 0:
+                wf_preds = clf_wf.predict(X_val)
+                wf_accuracy = float(np.mean(wf_preds == y_val))
+        except Exception:
+            pass
+
+    # 混合模型信心度（60%）與驗證準確率（40%）
+    confidence = round(raw_confidence * 0.6 + wf_accuracy * 0.4, 2)
     if confidence < 0.55:
         direction = "neutral"
 
-    return {"price": round(pred_price, 2), "direction": direction, "confidence": round(confidence, 2)}
+    return {"price": round(pred_price, 2), "direction": direction, "confidence": confidence}
 
 
 # --- Real-time price ---
@@ -428,7 +485,6 @@ def fetch_news_sentiment(stock_id: str, stock_name: str):
     conn.close()
 
     headlines = []
-    scores = []
     try:
         url = "https://api.cnyes.com/media/api/v1/newslist/category/tw_stock?limit=50&page=1"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -438,12 +494,37 @@ def fetch_news_sentiment(stock_id: str, stock_name: str):
             title = item.get("title", "")
             if stock_name in title or stock_id in title:
                 headlines.append(title)
-                scores.append(analyze_sentiment(title))
-    except:
+    except Exception:
         pass
 
-    avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
-    label = "正面" if avg_score > 0.1 else "負面" if avg_score < -0.1 else "中性"
+    # B1: Claude AI 情緒分析（有新聞時）；無新聞則退回關鍵字法
+    avg_score = 0.0
+    label = "中性"
+    if headlines:
+        try:
+            news_text = "\n".join(f"- {h}" for h in headlines[:10])
+            ai_resp = _anthropic_client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=120,
+                system=('你是台灣股市情緒分析師。只回傳 JSON，格式：'
+                        '{"score": -1到1之間的浮點數, "label": "正面"或"負面"或"中性"}。'
+                        'score > 0 為正面，< 0 為負面，接近 0 為中性。'),
+                messages=[{"role": "user", "content":
+                           f"股票：{stock_name}({stock_id})\n\n新聞標題：\n{news_text}"}]
+            )
+            raw = next(b for b in ai_resp.content if b.type == "text").text.strip()
+            parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            avg_score = round(float(parsed.get("score", 0.0)), 2)
+            label = parsed.get("label", "中性")
+        except Exception as e:
+            print(f"Claude 情緒分析失敗 {stock_id}: {e}")
+            scores = [analyze_sentiment(h) for h in headlines]
+            avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+            label = "正面" if avg_score > 0.1 else "負面" if avg_score < -0.1 else "中性"
+    else:
+        scores = [analyze_sentiment(h) for h in headlines]
+        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+        label = "正面" if avg_score > 0.1 else "負面" if avg_score < -0.1 else "中性"
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -726,19 +807,25 @@ def predict_and_report_single(stock_id: str):
         direction = result["direction"]
         confidence = result["confidence"]
 
+        pos = calc_position_size(confidence, direction,
+                                  winrate=wr_map.get(stock_id), taiex_change=taiex_change)
+
         if direction == "neutral":
             arrow, dir_text = "⚠️", f"方向不明（信心度 {confidence*100:.0f}%）"
         else:
             arrow = "↑" if direction == "up" else "↓"
             dir_text = f"{'看漲' if direction == 'up' else '看跌'}（信心度 {confidence*100:.0f}%）"
 
+        pos_text = f"\n💼 建議倉位：{pos['label']}"
+        if pos["reason"]:
+            pos_text += f"（{pos['reason']}）"
         sentiment_text = f"\n📰 新聞情緒：{news.get('label', '')}" if news.get("label") else ""
         market_warning = f"\n⚠️ 大盤今跌 {abs(taiex_change)*100:.1f}%，請謹慎" if taiex_change < -0.02 else ""
         send_telegram(
             f"📊 <b>{stock_name}（{stock_id}）預測</b>\n\n"
             f"目前價格：{current_price}\n"
             f"預測方向：{arrow} {dir_text}\n"
-            f"預測價格：<b>{predicted_price}</b>{sentiment_text}{market_warning}\n\n"
+            f"預測價格：<b>{predicted_price}</b>{pos_text}{sentiment_text}{market_warning}\n\n"
             f"🤖 AI 預測僅供參考，投資請謹慎"
         )
     except Exception as e:
@@ -795,6 +882,7 @@ def send_morning_report():
         return
 
     taiex_change = get_taiex_daily_change()
+    wr_map = get_stock_winrate_map()
     up_list = [r for r in rows if r[4] == "up"]
     down_list = [r for r in rows if r[4] == "down"]
     neutral_list = [r for r in rows if r[4] == "neutral"]
@@ -806,9 +894,13 @@ def send_morning_report():
     lines.append("─────────────────────")
 
     def fmt_row(r, arrow):
-        conf = f" [{r[6]*100:.0f}%]" if r[6] is not None else ""
-        sentiment = f" 【{r[5]}】" if r[5] else ""
-        return f"  {arrow} {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{conf}{sentiment}"
+        conf = r[6] or 0.0
+        wr = wr_map.get(r[1])
+        pos = calc_position_size(conf, r[4], winrate=wr, taiex_change=taiex_change)
+        conf_str = f" [{conf*100:.0f}%]" if conf else ""
+        pos_str = f" 【{pos['label']}】" if pos["ratio"] > 0 else " 【不進場】"
+        sentiment = f" {r[5]}" if r[5] else ""
+        return f"  {arrow} {r[0]}({r[1]})  {r[2]} → <b>{r[3]}</b>{conf_str}{pos_str}{sentiment}"
 
     lines.append("\n📈 <b>看漲</b>")
     for r in up_list:
@@ -1066,6 +1158,9 @@ async def analyze(req: StockRequest):
                                               stock_winrate=wr_map.get(req.stock_id))
         direction = clf_result["direction"]
         confidence = clf_result["confidence"]
+        taiex_change = get_taiex_daily_change()
+        pos = calc_position_size(confidence, direction,
+                                 winrate=wr_map.get(req.stock_id), taiex_change=taiex_change)
         last_date = pd.to_datetime(df["date"].iloc[-1])
         future_dates = [(last_date + timedelta(days=i+1)).strftime("%Y-%m-%d") for i in range(5)]
         close = recent["close"].tolist()
@@ -1090,6 +1185,9 @@ async def analyze(req: StockRequest):
             "trend": trend_text,
             "confidence": confidence,
             "direction": direction,
+            "position_label": pos["label"],
+            "position_ratio": pos["ratio"],
+            "position_reason": pos["reason"],
         }
     except Exception as e:
         return {"error": str(e)}
