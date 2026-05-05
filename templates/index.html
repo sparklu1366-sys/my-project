@@ -165,7 +165,7 @@ tr:last-child td { border-bottom: none; }
   <div class="page" id="page-stoploss">
     <div class="sl-header">
       <h2>停損 / 目標價提醒</h2>
-      <button class="btn-secondary" onclick="checkNow()">立即檢查現價</button>
+      <button class="btn-secondary" onclick="checkNow(this)">立即檢查現價</button>
     </div>
     <p style="color:#888;font-size:14px;margin-bottom:20px">每 30 分鐘自動檢查（交易日 9:00–14:00），觸發時 Telegram 通知</p>
     <div class="sl-grid" id="slGrid">載入中...</div>
@@ -409,6 +409,7 @@ async function loadStopLoss() {
     fetch("/stop-loss").then(r => r.json())
   ]);
 
+  // 用 data-* 屬性存名稱，避免單引號/特殊字元破壞 onclick
   document.getElementById("slGrid").innerHTML = stocks.map(s => {
     const sl = slData[s.id] || {};
     const triggered = sl.stop_triggered || sl.target_triggered;
@@ -421,35 +422,57 @@ async function loadStopLoss() {
       <label>目標價（達到時通知）</label>
       <input type="number" id="target_${s.id}" placeholder="例如 1000" step="0.5" value="${sl.target_price || ""}">
       <div class="sl-btns">
-        <button class="btn-save" onclick="saveStopLoss('${s.id}','${s.name}')">儲存</button>
-        <button class="btn-clear" onclick="clearStopLoss('${s.id}')">清除</button>
+        <button class="btn-save" data-id="${s.id}" data-name="${s.name.replace(/"/g,'&quot;')}" onclick="saveStopLoss(this)">儲存</button>
+        <button class="btn-clear" data-id="${s.id}" onclick="clearStopLoss(this)">清除</button>
       </div>
     </div>`;
   }).join("");
 }
 
-async function saveStopLoss(stockId, stockName) {
+async function saveStopLoss(btn) {
+  const stockId = btn.dataset.id;
+  const stockName = btn.dataset.name;
   const stopPrice = parseFloat(document.getElementById(`stop_${stockId}`).value) || null;
   const targetPrice = parseFloat(document.getElementById(`target_${stockId}`).value) || null;
-  await fetch("/stop-loss", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({stock_id: stockId, stock_name: stockName, stop_price: stopPrice, target_price: targetPrice})
-  });
-  alert(`${stockName} 設定已儲存`);
-  loadStopLoss();
+  btn.textContent = "儲存中..."; btn.disabled = true;
+  try {
+    const res = await fetch("/stop-loss", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({stock_id: stockId, stock_name: stockName, stop_price: stopPrice, target_price: targetPrice})
+    });
+    if (!res.ok) throw new Error(res.status);
+    btn.textContent = "✓ 已儲存";
+    setTimeout(() => { btn.textContent = "儲存"; btn.disabled = false; }, 1500);
+    loadStopLoss();
+  } catch(e) {
+    btn.textContent = "❌ 失敗";
+    setTimeout(() => { btn.textContent = "儲存"; btn.disabled = false; }, 2000);
+  }
 }
 
-async function clearStopLoss(stockId) {
-  await fetch(`/stop-loss/${stockId}`, {method: "DELETE"});
-  loadStopLoss();
+async function clearStopLoss(btn) {
+  const stockId = btn.dataset.id;
+  btn.textContent = "清除中..."; btn.disabled = true;
+  try {
+    await fetch(`/stop-loss/${stockId}`, {method: "DELETE"});
+    loadStopLoss();
+  } catch(e) {
+    btn.textContent = "❌ 失敗";
+    setTimeout(() => { btn.textContent = "清除"; btn.disabled = false; }, 2000);
+  }
 }
 
-async function checkNow() {
-  const btn = event.target;
+async function checkNow(btn) {
   btn.textContent = "檢查中..."; btn.disabled = true;
-  await fetch("/stop-loss/check-now", {method: "POST"});
-  btn.textContent = "立即檢查現價"; btn.disabled = false;
+  try {
+    await fetch("/stop-loss/check-now", {method: "POST"});
+    btn.textContent = "✓ 完成";
+    setTimeout(() => { btn.textContent = "立即檢查現價"; btn.disabled = false; }, 1500);
+  } catch(e) {
+    btn.textContent = "❌ 失敗";
+    setTimeout(() => { btn.textContent = "立即檢查現價"; btn.disabled = false; }, 2000);
+  }
   loadStopLoss();
 }
 
