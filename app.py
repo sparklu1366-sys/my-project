@@ -424,7 +424,16 @@ def predict_with_confidence(df, inst_df=None, taiex_df=None, margin_df=None,
     pred_price = float(scaler_y.inverse_transform(reg.predict(X_last).reshape(-1, 1))[0][0])
     proba = clf.predict_proba(X_last)[0]
     raw_confidence = float(max(proba))
-    direction = "up" if proba[1] > proba[0] else "down"
+
+    # 方向以迴歸器預測價格為準，確保方向與顯示價格一致
+    current_close = float(closes[-1])
+    price_chg_pct = (pred_price - current_close) / current_close
+    if abs(price_chg_pct) < 0.003:
+        direction = "neutral"
+    elif pred_price > current_close:
+        direction = "up"
+    else:
+        direction = "down"
 
     # A1: Walk-forward 時序驗證，校準信心度
     wf_accuracy = 0.5
